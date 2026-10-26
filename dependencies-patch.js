@@ -6,6 +6,25 @@ const path = require('node:path')
 const rootPath = path.join(__dirname, './')
 
 const patchs = [
+  [
+    path.join(rootPath, 'node_modules/react-native-track-player/android/src/main/java/com/guichaguri/trackplayer/service/MusicManager.java'),
+    '        DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory(service);',
+    `        DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory(service) {
+            @Override
+            protected androidx.media3.exoplayer.audio.AudioSink buildAudioSink(
+                    Context context,
+                    boolean enableFloatOutput,
+                    boolean enableAudioTrackPlaybackParams) {
+                return new androidx.media3.exoplayer.audio.DefaultAudioSink.Builder(context)
+                        .setEnableFloatOutput(enableFloatOutput)
+                        .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                        .setAudioProcessors(new androidx.media3.common.audio.AudioProcessor[]{
+                                cn.toside.music.mobile.dlna.DlnaAudioProcessor.getInstance()
+                        })
+                        .build();
+            }
+        };`,
+  ],
 ]
 
 ;(async() => {

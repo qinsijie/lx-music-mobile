@@ -132,7 +132,7 @@ android {
                 storePassword MYAPP_UPLOAD_STORE_PASSWORD
                 keyAlias MYAPP_UPLOAD_KEY_ALIAS
                 keyPassword MYAPP_UPLOAD_KEY_PASSWORD
-            } else {
+            } else if (rootProject.file("keystore.properties").exists()) {
                 def keystorePropertiesFile = rootProject.file("keystore.properties")
                 def keystoreProperties = new Properties()
                 keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
@@ -192,8 +192,12 @@ dependencies {
     implementation("com.facebook.react:react-android")
     implementation("com.facebook.react:flipper-integration")
     // implementation "androidx.javascriptengine:javascriptengine:1.0.0-alpha07"
-    // implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation 'wang.harlon.quickjs:wrapper-android:2.4.0'
+
+    def media3Version = '1.8.0'
+    implementation "androidx.media3:media3-exoplayer:$media3Version"
+    implementation "androidx.media3:media3-common:$media3Version"
 
   if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")
@@ -201,5 +205,35 @@ dependencies {
         implementation jscFlavor
     }
 }
+
+task patchReactNativeTrackPlayer {
+    doLast {
+        def targetFile = file("../../node_modules/react-native-track-player/android/src/main/java/com/guichaguri/trackplayer/service/MusicManager.java")
+        if (targetFile.exists()) {
+            def content = targetFile.text
+            def fromStr = "DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory(service);"
+            def toStr = """DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory(service) {
+            @Override
+            protected androidx.media3.exoplayer.audio.AudioSink buildAudioSink(
+                    Context context,
+                    boolean enableFloatOutput,
+                    boolean enableAudioTrackPlaybackParams) {
+                return new androidx.media3.exoplayer.audio.DefaultAudioSink.Builder(context)
+                        .setEnableFloatOutput(enableFloatOutput)
+                        .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                        .setAudioProcessors(new androidx.media3.common.audio.AudioProcessor[]{
+                                cn.toside.music.mobile.dlna.DlnaAudioProcessor.getInstance()
+                        })
+                        .build();
+            }
+        };"""
+            if (content.contains(fromStr)) {
+                println("Applying DlnaAudioProcessor patch to MusicManager.java...")
+                targetFile.text = content.replace(fromStr, toStr)
+            }
+        }
+    }
+}
+preBuild.dependsOn patchReactNativeTrackPlayer
 
 apply from: file("../../node_modules/@react-native-community/cli-platform-android/native_modules.gradle"); applyNativeModulesAppBuildGradle(project)

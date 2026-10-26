@@ -14,6 +14,7 @@ import SettingPopup, { type SettingPopupType } from '../../components/SettingPop
 import { useStatusbarHeight } from '@/store/common/hook'
 import Btn from './Btn'
 import TimeoutExitBtn from './TimeoutExitBtn'
+import DlnaCastBtn from './DlnaCastBtn'
 
 export const HEADER_HEIGHT = scaleSizeH(_HEADER_HEIGHT)
 
@@ -48,6 +49,7 @@ export default memo(() => {
       <View style={styles.container}>
         <Btn icon="chevron-left" onPress={back} />
         <Title />
+        <DlnaCastBtn />
         <TimeoutExitBtn />
         <Btn icon="slider" onPress={showSetting} />
       </View>
