@@ -145,10 +145,9 @@ class DlnaAudioProcessor : BaseAudioProcessor() {
     }
 
     companion object {
-        @JvmStatic
-        val instance = DlnaAudioProcessor()
+        private val INSTANCE = DlnaAudioProcessor()
 
         @JvmStatic
-        fun getInstance(): DlnaAudioProcessor = instance
+        fun getInstance(): DlnaAudioProcessor = INSTANCE
     }
 }
