@@ -110,8 +110,13 @@ object HqpeClient {
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "SOAP $action error: ${e.message}", e)
-            Result.failure(e)
+            val errMsg = if (e is java.net.SocketTimeoutException) {
+                "SOAP $action 超时 (15秒未收到响应)"
+            } else {
+                "SOAP $action 异常: ${e.message}"
+            }
+            Log.e(TAG, errMsg, e)
+            Result.failure(IOException(errMsg, e))
         }
     }
 }

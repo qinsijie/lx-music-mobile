@@ -91,31 +91,36 @@ object DlnaManager {
                     localHttpServer = server
                 }
 
-                // 2. 解析面向目标设备 IP 的精准本机 IP (规避 VPN/虚拟网卡)
+                // 2. 提前激活 STREAMING 状态，解除缓冲饥饿死锁，让当前 ExoPlayer 的 PCM 音频无延迟进入缓冲区等待拉取
+                updateState(DlnaState.STREAMING)
+
+                // 3. 解析面向目标设备 IP 的精准本机 IP (规避 VPN/虚拟网卡)
                 val localIp = NetworkUtils.getLocalIpAddress(context, device.ip, device.port)
                 val streamUrl = "http://$localIp:$port/stream.wav"
                 Log.i(TAG, "Target stream URL prepared: $streamUrl for device ${device.friendlyName}")
 
-                // 3. 执行 SOAP SetAVTransportURI
+                // 4. 执行 SOAP SetAVTransportURI
                 val setUriResult = HqpeClient.setUri(device.controlUrl, streamUrl)
                 if (setUriResult.isFailure) {
-                    val err = setUriResult.exceptionOrNull()?.message ?: "Failed to set AVTransport URI"
-                    throw IllegalStateException(err)
+                    val err = setUriResult.exceptionOrNull()?.message ?: "未知错误"
+                    throw IllegalStateException("[SetAVTransportURI 阶段] $err")
                 }
 
-                // 4. 执行 SOAP Play
+                // 5. 执行 SOAP Play
                 val playResult = HqpeClient.play(device.controlUrl)
                 if (playResult.isFailure) {
-                    val err = playResult.exceptionOrNull()?.message ?: "Failed to trigger Play action"
-                    throw IllegalStateException(err)
+                    val err = playResult.exceptionOrNull()?.message ?: "未知错误"
+                    throw IllegalStateException("[Play 阶段] $err")
                 }
 
-                updateState(DlnaState.STREAMING)
                 Log.i(TAG, "Successfully started streaming to ${device.friendlyName} via $streamUrl")
                 callback?.invoke(true, null)
 
             } catch (e: Exception) {
                 Log.e(TAG, "startStreaming error: ${e.message}", e)
+                currentDevice = null
+                localHttpServer?.stop()
+                localHttpServer = null
                 updateState(DlnaState.ERROR, e.message)
                 eventListener?.onError(e.message ?: "Streaming initiation error")
                 callback?.invoke(false, e.message)

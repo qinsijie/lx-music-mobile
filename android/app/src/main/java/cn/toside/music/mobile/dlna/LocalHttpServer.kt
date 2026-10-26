@@ -118,21 +118,24 @@ class LocalHttpServer(val port: Int = 8088) {
                 if (method == "GET") {
                     val isChunked = path.contains("chunked=1")
                     val wavHeader = createWavHeader(48000, 2, 16)
+                    val silencePreBuffer = ByteArray(38400) // 200ms 48000Hz 16-bit 双声道 PCM 静音数据预填充
                     val subscriber = ClientSubscriber(socket, out, isChunked)
 
                     synchronized(subscriber.outputStream) {
                         if (isChunked) {
                             sendChunkedHeaders(out)
                             sendChunk(out, wavHeader, 0, wavHeader.size)
+                            sendChunk(out, silencePreBuffer, 0, silencePreBuffer.size)
                         } else {
                             sendRawContinuousHeaders(out)
                             out.write(wavHeader)
+                            out.write(silencePreBuffer)
                         }
                         out.flush()
                     }
 
                     subscribers.add(subscriber)
-                    Log.i(tag, "Client subscribed to audio stream (chunked=$isChunked): ${socket.remoteSocketAddress}. 44-byte WAV header sent and flushed immediately. Total clients: ${subscribers.size}")
+                    Log.i(tag, "Client subscribed to audio stream (chunked=$isChunked): ${socket.remoteSocketAddress}. 44-byte WAV header and 200ms silence pre-buffer sent and flushed immediately. Total clients: ${subscribers.size}")
 
                     // Keep socket open until client disconnects
                     val input = socket.getInputStream()
