@@ -22,7 +22,7 @@ public class MainApplication extends NavigationApplication {
       new NavigationReactNativeHost(this) {
         @Override
         public boolean getUseDeveloperSupport() {
-          return BuildConfig.DEBUG;
+          return false;
         }
 
         @Override
