@@ -12,6 +12,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * 本地实时音频推流 HTTP 服务器
@@ -37,6 +38,12 @@ class LocalHttpServer(val port: Int = 8088) {
     private val subscribers = CopyOnWriteArrayList<ClientSubscriber>()
     private val crlf = "\r\n".toByteArray(Charsets.US_ASCII)
 
+    private var silenceThread: Thread? = null
+    private val lastRealAudioTime = AtomicLong(0L)
+    private val SILENCE_THRESHOLD_MS = 80L // 80ms 无真实 PCM 判定为缓冲/切歌空档
+    private val SILENCE_CHUNK_BYTES = 3840 // 20ms 的 48000Hz 16-bit 双声道 PCM (48000 * 2 * 2 * 0.02)
+    private val silenceChunk = ByteArray(SILENCE_CHUNK_BYTES)
+
     @Synchronized
     fun start(): Boolean {
         if (isRunning.get()) return true
@@ -60,6 +67,8 @@ class LocalHttpServer(val port: Int = 8088) {
                     }
                 }
             }, "HttpServer-Accept").apply { start() }
+
+            silenceThread = Thread({ runSilenceFeeder() }, "HttpServer-SilenceFeeder").apply { start() }
 
             return true
         } catch (e: Exception) {
@@ -220,6 +229,8 @@ class LocalHttpServer(val port: Int = 8088) {
     fun writeAudioData(buffer: ByteArray, offset: Int, length: Int) {
         if (!isRunning.get() || subscribers.isEmpty() || length <= 0) return
 
+        lastRealAudioTime.set(System.currentTimeMillis())
+
         writeCount++
         if (writeCount % 100L == 1L) {
             Log.i(tag, "writeAudioData #$writeCount: $length bytes sent to ${subscribers.size} client(s)")
@@ -243,6 +254,103 @@ class LocalHttpServer(val port: Int = 8088) {
         }
     }
 
+    /**
+     * 后台静音垫片轮询器：
+     * 当切歌、网络缓冲或暂停导致 ExoPlayer 短暂停止流入 PCM 数据时，
+     * 以严格 48000Hz 16-bit 双声道实时节拍 (192,000 bytes/s) 持续输出静音 PCM，
+     * 确保 HQPE 永远不会遇到数据饥饿、不会触发 EOS / idle_req，实现换曲完全无缝不中断。
+     */
+    private fun runSilenceFeeder() {
+        Log.i(tag, "Silence feeder thread started")
+        var inSilenceMode = false
+        var silenceStartTime = 0L
+        var silenceBytesSent = 0L
+        var silenceCount = 0L
+
+        while (isRunning.get()) {
+            try {
+                if (subscribers.isEmpty()) {
+                    if (inSilenceMode) {
+                        inSilenceMode = false
+                        silenceBytesSent = 0L
+                    }
+                    Thread.sleep(30)
+                    continue
+                }
+
+                val now = System.currentTimeMillis()
+                val lastReal = lastRealAudioTime.get()
+                val elapsedSinceReal = now - lastReal
+
+                // 若距离上一包真实 PCM 超过 SILENCE_THRESHOLD_MS (80ms)
+                if (elapsedSinceReal >= SILENCE_THRESHOLD_MS) {
+                    if (!inSilenceMode) {
+                        inSilenceMode = true
+                        silenceStartTime = System.nanoTime()
+                        silenceBytesSent = 0L
+                        Log.i(tag, "Silence feeder activated (gap: ${elapsedSinceReal}ms) - pumping steady silence PCM to HQPE")
+                    }
+
+                    // 速率对齐：严格按照 192,000 bytes/sec 计算应推字节数
+                    val elapsedNanos = System.nanoTime() - silenceStartTime
+                    val expectedBytes = (elapsedNanos * 192000L) / 1_000_000_000L
+
+                    // 避免突发积压过多导致瞬间刷屏，最多允许预充 200ms
+                    if (expectedBytes - silenceBytesSent > 38400L) {
+                        silenceBytesSent = expectedBytes - 38400L
+                    }
+
+                    while (silenceBytesSent < expectedBytes && isRunning.get() && subscribers.isNotEmpty()) {
+                        // 如果中途真实音频到达，立刻退出静音发送
+                        if (System.currentTimeMillis() - lastRealAudioTime.get() < SILENCE_THRESHOLD_MS) {
+                            break
+                        }
+
+                        silenceCount++
+                        if (silenceCount % 100L == 1L) {
+                            Log.i(tag, "Silence feeder #$silenceCount: $SILENCE_CHUNK_BYTES silence bytes sent to ${subscribers.size} client(s)")
+                        }
+
+                        for (subscriber in subscribers) {
+                            try {
+                                synchronized(subscriber.outputStream) {
+                                    if (subscriber.isChunked) {
+                                        sendChunk(subscriber.outputStream, silenceChunk, 0, SILENCE_CHUNK_BYTES)
+                                    } else {
+                                        subscriber.outputStream.write(silenceChunk, 0, SILENCE_CHUNK_BYTES)
+                                        subscriber.outputStream.flush()
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                Log.d(tag, "Client disconnected during silence send: ${e.message}")
+                                subscribers.remove(subscriber)
+                                try { subscriber.socket.close() } catch (_: Exception) {}
+                            }
+                        }
+                        silenceBytesSent += SILENCE_CHUNK_BYTES
+                    }
+
+                    Thread.sleep(10)
+                } else {
+                    if (inSilenceMode) {
+                        inSilenceMode = false
+                        silenceBytesSent = 0L
+                        Log.i(tag, "Real audio resumed; silence feeder on standby")
+                    }
+                    val sleepMs = (SILENCE_THRESHOLD_MS - elapsedSinceReal).coerceIn(10L, 30L)
+                    Thread.sleep(sleepMs)
+                }
+            } catch (_: InterruptedException) {
+                break
+            } catch (e: Exception) {
+                if (isRunning.get()) {
+                    Log.e(tag, "Error in silence feeder loop", e)
+                }
+            }
+        }
+        Log.i(tag, "Silence feeder thread stopped")
+    }
+
     @Synchronized
     fun stop() {
         if (!isRunning.getAndSet(false)) return
@@ -253,6 +361,9 @@ class LocalHttpServer(val port: Int = 8088) {
             Log.e(tag, "Error closing server socket", e)
         }
         serverSocket = null
+
+        silenceThread?.interrupt()
+        silenceThread = null
 
         for (subscriber in subscribers) {
             try {

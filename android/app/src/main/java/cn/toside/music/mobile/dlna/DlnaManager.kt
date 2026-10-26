@@ -55,18 +55,26 @@ object DlnaManager {
 
     /**
      * 扫描局域网中的 DLNA 设备
+     * 注意：严格保持推流状态机，若当前处于 STREAMING 或 CONNECTING，严禁被扫描覆写为 SCANNING 或 IDLE
      */
     fun scanDevices(context: Context, timeoutMs: Int = 3000, callback: ((List<DlnaDevice>) -> Unit)? = null) {
-        updateState(DlnaState.SCANNING)
+        val stateBeforeScan = currentState.get()
+        if (stateBeforeScan != DlnaState.STREAMING && stateBeforeScan != DlnaState.CONNECTING) {
+            updateState(DlnaState.SCANNING)
+        }
         scope.launch {
             try {
                 val devices = SsdpScanner.scan(context, timeoutMs)
-                updateState(DlnaState.IDLE)
+                if (currentState.get() == DlnaState.SCANNING) {
+                    updateState(DlnaState.IDLE)
+                }
                 eventListener?.onDevicesDiscovered(devices)
                 callback?.invoke(devices)
             } catch (e: Exception) {
                 Log.e(TAG, "Device scan failed: ${e.message}", e)
-                updateState(DlnaState.ERROR, e.message)
+                if (currentState.get() == DlnaState.SCANNING) {
+                    updateState(DlnaState.IDLE)
+                }
                 eventListener?.onError("Scan failed: ${e.message}")
                 callback?.invoke(emptyList())
             }
@@ -77,6 +85,18 @@ object DlnaManager {
      * 连接至指定的 DLNA 渲染设备并启动串流
      */
     fun startStreaming(context: Context, device: DlnaDevice, port: Int = DEFAULT_PORT, callback: ((Boolean, String?) -> Unit)? = null) {
+        // 防重复投送：若当前推流长连接处于活跃状态，拦截对同一设备的重复 SetAVTransportURI 和 Play 调用
+        val isAlreadyStreaming = currentState.get() == DlnaState.STREAMING
+        val isSameDevice = currentDevice?.id == device.id ||
+                (currentDevice?.ip == device.ip && currentDevice?.controlUrl == device.controlUrl)
+        val isServerActive = localHttpServer?.isRunning() == true
+
+        if (isAlreadyStreaming && isSameDevice && isServerActive) {
+            Log.i(TAG, "Already actively streaming to device ${device.friendlyName} (${device.ip}). Guarding against duplicate startStreaming.")
+            callback?.invoke(true, null)
+            return
+        }
+
         updateState(DlnaState.CONNECTING)
         currentDevice = device
 
@@ -103,14 +123,24 @@ object DlnaManager {
                 val setUriResult = HqpeClient.setUri(device.controlUrl, streamUrl)
                 if (setUriResult.isFailure) {
                     val err = setUriResult.exceptionOrNull()?.message ?: "未知错误"
-                    throw IllegalStateException("[SetAVTransportURI 阶段] $err")
+                    // 若返回 701 (Transition not available)，表明 HQPE 当前已在播放该流，允许通过
+                    if (err.contains("701") && (localHttpServer?.getClientCount() ?: 0) > 0) {
+                        Log.w(TAG, "SetAVTransportURI returned 701 but client is already connected, treating as success.")
+                    } else {
+                        throw IllegalStateException("[SetAVTransportURI 阶段] $err")
+                    }
                 }
 
                 // 5. 执行 SOAP Play
                 val playResult = HqpeClient.play(device.controlUrl)
                 if (playResult.isFailure) {
                     val err = playResult.exceptionOrNull()?.message ?: "未知错误"
-                    throw IllegalStateException("[Play 阶段] $err")
+                    // 若返回 701 (Transition not available)，表明 HQPE 当前已在 PLAYING 状态，允许通过
+                    if (err.contains("701") && (localHttpServer?.getClientCount() ?: 0) > 0) {
+                        Log.w(TAG, "Play returned 701 but client is already playing, treating as success.")
+                    } else {
+                        throw IllegalStateException("[Play 阶段] $err")
+                    }
                 }
 
                 Log.i(TAG, "Successfully started streaming to ${device.friendlyName} via $streamUrl")

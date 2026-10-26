@@ -45,6 +45,11 @@ export const initDlna = () => {
 
   // 监听原生状态流转
   onDlnaStateChanged(({ state: newState, message }) => {
+    // 严格锁定状态机：一旦处于 STREAMING，除非用户显式断开 (STOPPED/IDLE) 或发生致命错误 (ERROR)，
+    // 严禁因任何后台扫描或切歌刷新而跳回 IDLE
+    if (state.state === 'STREAMING' && (newState === 'SCANNING' || newState === 'IDLE')) {
+      return
+    }
     state.state = newState
     if (newState === 'IDLE' || newState === 'STOPPED') {
       state.currentDevice = null
@@ -100,6 +105,13 @@ export const scanDlnaDevices = async(timeoutMs: number = 3000): Promise<DlnaDevi
  */
 export const connectDlnaDevice = async(device: DlnaDevice): Promise<boolean> => {
   initDlna()
+
+  // 防重复投送：若已经在向该设备推流中，直接保持连接并提示
+  if (state.state === 'STREAMING' && state.currentDevice?.id === device.id) {
+    toast(`当前正在串流至 ${device.name}`)
+    return true
+  }
+
   try {
     // 1. 记录当前应用音量 (不影响系统全局媒体音量)
     state.savedVolume = settingState.setting['player.volume'] ?? 1

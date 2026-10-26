@@ -49,6 +49,12 @@ export default forwardRef<DlnaModalType, {}>((props, ref) => {
     void disconnectDlnaDevice()
   }
 
+  // 保证已连接设备始终显示在列表最前，即使局域网扫描响应延迟
+  const displayDevices = [...devices]
+  if (isStreaming && currentDevice && !displayDevices.some(d => d.id === currentDevice.id)) {
+    displayDevices.unshift(currentDevice)
+  }
+
   return (
     <Dialog ref={dialogRef} title="DLNA 音频投送 (HQPE-DLNA)" closeBtn>
       <View style={styles.container}>
@@ -87,7 +93,7 @@ export default forwardRef<DlnaModalType, {}>((props, ref) => {
 
         {/* 局域网设备列表 */}
         <View style={styles.listHeader}>
-          <Text size={12} color={theme['c-font-label']}>局域网渲染器 ({devices.length})</Text>
+          <Text size={12} color={theme['c-font-label']}>局域网渲染器 ({displayDevices.length})</Text>
           <TouchableOpacity style={styles.refreshBtn} onPress={handleRefresh} disabled={isScanning}>
             {isScanning ? (
               <ActivityIndicator size="small" color={theme['c-primary']} />
@@ -98,7 +104,7 @@ export default forwardRef<DlnaModalType, {}>((props, ref) => {
         </View>
 
         <ScrollView style={styles.listScrollView} contentContainerStyle={styles.listContent}>
-          {devices.length === 0 ? (
+          {displayDevices.length === 0 ? (
             <View style={styles.emptyWrap}>
               {isScanning ? (
                 <>
@@ -117,7 +123,7 @@ export default forwardRef<DlnaModalType, {}>((props, ref) => {
               )}
             </View>
           ) : (
-            devices.map(device => {
+            displayDevices.map(device => {
               const isCurrent = isStreaming && currentDevice?.id === device.id
               return (
                 <TouchableOpacity
