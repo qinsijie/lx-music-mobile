@@ -15,12 +15,21 @@ const patchs = [
                     Context context,
                     boolean enableFloatOutput,
                     boolean enableAudioTrackPlaybackParams) {
+                androidx.media3.common.audio.AudioProcessor customProcessor = null;
+                try {
+                    Class<?> clazz = Class.forName("cn.toside.music.mobile.dlna.DlnaAudioProcessor");
+                    java.lang.reflect.Method method = clazz.getMethod("getInstance");
+                    customProcessor = (androidx.media3.common.audio.AudioProcessor) method.invoke(null);
+                } catch (Throwable ignored) {}
+
+                androidx.media3.common.audio.AudioProcessor[] processors = customProcessor != null
+                        ? new androidx.media3.common.audio.AudioProcessor[]{ customProcessor }
+                        : new androidx.media3.common.audio.AudioProcessor[0];
+
                 return new androidx.media3.exoplayer.audio.DefaultAudioSink.Builder(context)
                         .setEnableFloatOutput(enableFloatOutput)
                         .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
-                        .setAudioProcessors(new androidx.media3.common.audio.AudioProcessor[]{
-                                cn.toside.music.mobile.dlna.DlnaAudioProcessor.getInstance()
-                        })
+                        .setAudioProcessors(processors)
                         .build();
             }
         };`,
@@ -39,4 +48,3 @@ const patchs = [
   }
   console.log('\nDependencies patch finished.\n')
 })()
-
