@@ -65,6 +65,16 @@ public class MainApplication extends NavigationApplication {
   public void onCreate() {
     super.onCreate();
 
+    // Direct link: register DlnaManager as listener for TrackPlayer DlnaAudioProcessor
+    com.guichaguri.trackplayer.service.DlnaAudioProcessor.setListener(
+        new com.guichaguri.trackplayer.service.DlnaAudioProcessor.AudioDataListener() {
+            @Override
+            public void onAudioData(byte[] buffer, int offset, int length) {
+                cn.toside.music.mobile.dlna.DlnaManager.INSTANCE.writePcmData(buffer, offset, length);
+            }
+        }
+    );
+
     if (BuildConfig.IS_NEW_ARCHITECTURE_ENABLED) {
       // If you opted-in for the New Architecture, we load the native entry point for this app.
       DefaultNewArchitectureEntryPoint.load();

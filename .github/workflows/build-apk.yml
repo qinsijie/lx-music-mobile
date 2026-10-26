@@ -33,6 +33,13 @@ jobs:
           yarn install || npm install --legacy-peer-deps
           node dependencies-patch.js
 
+      - name: Verify MusicManager Patches
+        run: |
+          test -f node_modules/react-native-track-player/android/src/main/java/com/guichaguri/trackplayer/service/DlnaAudioProcessor.java
+          grep -n "DlnaAudioProcessor" node_modules/react-native-track-player/android/src/main/java/com/guichaguri/trackplayer/service/MusicManager.java
+          grep -n "shouldEnableAudioOffload = false" node_modules/react-native-track-player/android/src/main/java/com/guichaguri/trackplayer/service/MusicManager.java
+          echo "All DLNA patches verified successfully!"
+
       - name: Grant execute permission for gradlew
         run: chmod +x android/gradlew
 

@@ -206,51 +206,25 @@ dependencies {
 task patchReactNativeTrackPlayer {
     doLast {
         def targetFile = file("../../node_modules/react-native-track-player/android/src/main/java/com/guichaguri/trackplayer/service/MusicManager.java")
-        if (targetFile.exists()) {
-            def content = targetFile.text
+        def processorFile = file("../../node_modules/react-native-track-player/android/src/main/java/com/guichaguri/trackplayer/service/DlnaAudioProcessor.java")
 
-            def offloadFrom = "boolean shouldEnableAudioOffload = options.getBoolean(\"audioOffload\", true);"
-            def offloadTo = "boolean shouldEnableAudioOffload = false; // DLNA: disable hardware offload"
-            if (content.contains(offloadFrom)) {
-                println("Disabling audioOffload in MusicManager.java...")
-                content = content.replace(offloadFrom, offloadTo)
+        // Run node dependencies-patch.js if needed
+        if (!processorFile.exists() || !targetFile.text.contains("DlnaAudioProcessor")) {
+            println("DlnaAudioProcessor patch not detected in react-native-track-player, invoking dependencies-patch.js...")
+            exec {
+                workingDir = file("../..")
+                commandLine = ["node", "dependencies-patch.js"]
             }
-
-            def fromStr = "DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory(service);"
-            def toStr = """DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory(service) {
-            @Override
-            protected androidx.media3.exoplayer.audio.AudioSink buildAudioSink(
-                    Context context,
-                    boolean enableFloatOutput,
-                    boolean enableAudioTrackPlaybackParams) {
-                android.util.Log.i("DlnaAudioProcessor", "buildAudioSink invoked in MusicManager!");
-                androidx.media3.common.audio.AudioProcessor customProcessor = null;
-                try {
-                    Class<?> clazz = Class.forName("cn.toside.music.mobile.dlna.DlnaAudioProcessor");
-                    java.lang.reflect.Method method = clazz.getMethod("getInstance");
-                    customProcessor = (androidx.media3.common.audio.AudioProcessor) method.invoke(null);
-                    android.util.Log.i("DlnaAudioProcessor", "Successfully resolved DlnaAudioProcessor: " + customProcessor);
-                } catch (Throwable t) {
-                    android.util.Log.e("DlnaAudioProcessor", "FAILED to resolve DlnaAudioProcessor: ", t);
-                }
-
-                androidx.media3.common.audio.AudioProcessor[] processors = customProcessor != null
-                        ? new androidx.media3.common.audio.AudioProcessor[]{ customProcessor }
-                        : new androidx.media3.common.audio.AudioProcessor[0];
-
-                return new androidx.media3.exoplayer.audio.DefaultAudioSink.Builder(context)
-                        .setEnableFloatOutput(false)
-                        .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
-                        .setAudioProcessors(processors)
-                        .build();
-            }
-        };"""
-            if (content.contains(fromStr)) {
-                println("Applying DlnaAudioProcessor patch to MusicManager.java...")
-                content = content.replace(fromStr, toStr)
-            }
-            targetFile.text = content
         }
+
+        // Hard assertion at compile time
+        if (!targetFile.exists() || !targetFile.text.contains("DlnaAudioProcessor")) {
+            throw new GradleException("COMPILE ASSERTION FAILED: MusicManager.java is not patched with DlnaAudioProcessor!")
+        }
+        if (!processorFile.exists()) {
+            throw new GradleException("COMPILE ASSERTION FAILED: DlnaAudioProcessor.java is missing in react-native-track-player!")
+        }
+        println("COMPILE ASSERTION PASSED: DlnaAudioProcessor is strictly patched and verified in react-native-track-player.")
     }
 }
 preBuild.dependsOn patchReactNativeTrackPlayer
