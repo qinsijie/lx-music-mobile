@@ -29,6 +29,7 @@ class DlnaAudioProcessor : BaseAudioProcessor() {
     private var resampleFraction = 0.0
     private var lastLeftSample = 0
     private var lastRightSample = 0
+    private var queueCount = 0L
 
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
         Log.i(tag, "Configuring AudioProcessor with input: " +
@@ -36,8 +37,8 @@ class DlnaAudioProcessor : BaseAudioProcessor() {
                 "channelCount=${inputAudioFormat.channelCount}, " +
                 "encoding=${inputAudioFormat.encoding}")
 
-        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT) {
-            // 支持 16-bit PCM，若为其他格式通知下游按默认处理
+        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT && inputAudioFormat.encoding != C.ENCODING_PCM_FLOAT) {
+            Log.w(tag, "Audio format encoding ${inputAudioFormat.encoding} not supported by DlnaAudioProcessor")
             return AudioProcessor.AudioFormat.NOT_SET
         }
 
@@ -54,19 +55,26 @@ class DlnaAudioProcessor : BaseAudioProcessor() {
         val remaining = inputBuffer.remaining()
         if (remaining == 0) return
 
+        queueCount++
+        if (queueCount % 100L == 1L) {
+            Log.i(tag, "queueInput #$queueCount: $remaining bytes received, isStreaming=${DlnaManager.isStreaming()}")
+        }
+
         // 仅在 DLNA 处于推流状态时捕获并分发音频数据
         if (DlnaManager.isStreaming()) {
             val duplicate = inputBuffer.duplicate()
             duplicate.order(ByteOrder.LITTLE_ENDIAN)
             val inputFormat = inputAudioFormat
 
-            if (inputFormat.sampleRate == targetSampleRate && inputFormat.channelCount == targetChannels) {
-                // 完全匹配 48kHz 立体声，直接批量提取投递
+            if (inputFormat.encoding == C.ENCODING_PCM_16BIT &&
+                inputFormat.sampleRate == targetSampleRate &&
+                inputFormat.channelCount == targetChannels) {
+                // 完全匹配 48kHz 16-bit 立体声，直接批量提取投递
                 val pcmBytes = ByteArray(duplicate.remaining())
                 duplicate.get(pcmBytes)
                 DlnaManager.writePcmData(pcmBytes, 0, pcmBytes.size)
             } else {
-                // 采样率或声道数不一致时，实时转换归一化至 48kHz 16-bit 双声道
+                // 采样率、声道数或编码不一致时，实时转换归一化至 48kHz 16-bit 双声道
                 val convertedBytes = convertToTargetPcm(duplicate, inputFormat)
                 if (convertedBytes.isNotEmpty()) {
                     DlnaManager.writePcmData(convertedBytes, 0, convertedBytes.size)
@@ -81,12 +89,14 @@ class DlnaAudioProcessor : BaseAudioProcessor() {
     }
 
     /**
-     * 将任意 16-bit PCM 输入流转换为标准 48000Hz 立体声 16-bit PCM
+     * 将任意 16-bit / Float PCM 输入流转换为标准 48000Hz 立体声 16-bit PCM
      */
     private fun convertToTargetPcm(buffer: ByteBuffer, format: AudioProcessor.AudioFormat): ByteArray {
         val inChannels = format.channelCount
         val inSampleRate = format.sampleRate
-        val totalInFrames = buffer.remaining() / (inChannels * targetBytesPerSample)
+        val isFloat = format.encoding == C.ENCODING_PCM_FLOAT
+        val bytesPerSample = if (isFloat) 4 else 2
+        val totalInFrames = buffer.remaining() / (inChannels * bytesPerSample)
         if (totalInFrames <= 0) return ByteArray(0)
 
         // 估算输出帧数
@@ -94,14 +104,26 @@ class DlnaAudioProcessor : BaseAudioProcessor() {
         val outBytes = ByteArray(estimatedOutFrames * targetChannels * targetBytesPerSample)
         val outBuf = ByteBuffer.wrap(outBytes).order(ByteOrder.LITTLE_ENDIAN)
 
-        while (buffer.remaining() >= inChannels * targetBytesPerSample) {
-            val left = buffer.short.toInt()
-            val right = if (inChannels >= 2) buffer.short.toInt() else left
+        while (buffer.remaining() >= inChannels * bytesPerSample) {
+            val left = if (isFloat) {
+                (buffer.float.coerceIn(-1.0f, 1.0f) * 32767.0f).toInt()
+            } else {
+                buffer.short.toInt()
+            }
+            val right = if (inChannels >= 2) {
+                if (isFloat) {
+                    (buffer.float.coerceIn(-1.0f, 1.0f) * 32767.0f).toInt()
+                } else {
+                    buffer.short.toInt()
+                }
+            } else left
 
             // 跳过多余声道
             if (inChannels > 2) {
                 for (ch in 2 until inChannels) {
-                    if (buffer.remaining() >= 2) buffer.short
+                    if (buffer.remaining() >= bytesPerSample) {
+                        if (isFloat) buffer.float else buffer.short
+                    }
                 }
             }
 

@@ -212,11 +212,18 @@ class LocalHttpServer(val port: Int = 8088) {
         out.flush()
     }
 
+    private var writeCount = 0L
+
     /**
      * 将 PCM 音频数据分发写入所有活跃的客户端连接
      */
     fun writeAudioData(buffer: ByteArray, offset: Int, length: Int) {
         if (!isRunning.get() || subscribers.isEmpty() || length <= 0) return
+
+        writeCount++
+        if (writeCount % 100L == 1L) {
+            Log.i(tag, "writeAudioData #$writeCount: $length bytes sent to ${subscribers.size} client(s)")
+        }
 
         for (subscriber in subscribers) {
             try {
