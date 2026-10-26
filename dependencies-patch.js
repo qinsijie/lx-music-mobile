@@ -48,7 +48,6 @@ public class DlnaAudioProcessor extends BaseAudioProcessor {
     private double resampleFraction = 0.0;
     private int lastLeftSample = 0;
     private int lastRightSample = 0;
-    private long queueCount = 0;
 
     public DlnaAudioProcessor() {
         Log.i(TAG, "DlnaAudioProcessor instance constructed!");
@@ -79,11 +78,7 @@ public class DlnaAudioProcessor extends BaseAudioProcessor {
         int remaining = inputBuffer.remaining();
         if (remaining == 0) return;
 
-        queueCount++;
         AudioDataListener listener = dataListener;
-        if (queueCount % 100 == 1) {
-            Log.i(TAG, "queueInput #" + queueCount + ": " + remaining + " bytes, listener=" + (listener != null));
-        }
 
         if (listener != null) {
             ByteBuffer duplicate = inputBuffer.duplicate();

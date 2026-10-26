@@ -221,8 +221,6 @@ class LocalHttpServer(val port: Int = 8088) {
         out.flush()
     }
 
-    private var writeCount = 0L
-
     /**
      * 将 PCM 音频数据分发写入所有活跃的客户端连接
      */
@@ -230,11 +228,6 @@ class LocalHttpServer(val port: Int = 8088) {
         if (!isRunning.get() || subscribers.isEmpty() || length <= 0) return
 
         lastRealAudioTime.set(System.currentTimeMillis())
-
-        writeCount++
-        if (writeCount % 100L == 1L) {
-            Log.i(tag, "writeAudioData #$writeCount: $length bytes sent to ${subscribers.size} client(s)")
-        }
 
         for (subscriber in subscribers) {
             try {
@@ -265,7 +258,6 @@ class LocalHttpServer(val port: Int = 8088) {
         var inSilenceMode = false
         var silenceStartTime = 0L
         var silenceBytesSent = 0L
-        var silenceCount = 0L
 
         while (isRunning.get()) {
             try {
@@ -304,11 +296,6 @@ class LocalHttpServer(val port: Int = 8088) {
                         // 如果中途真实音频到达，立刻退出静音发送
                         if (System.currentTimeMillis() - lastRealAudioTime.get() < SILENCE_THRESHOLD_MS) {
                             break
-                        }
-
-                        silenceCount++
-                        if (silenceCount % 100L == 1L) {
-                            Log.i(tag, "Silence feeder #$silenceCount: $SILENCE_CHUNK_BYTES silence bytes sent to ${subscribers.size} client(s)")
                         }
 
                         for (subscriber in subscribers) {
