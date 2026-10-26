@@ -46,5 +46,20 @@ const patchs = [
       console.error(`Patch ${filePath.replace(rootPath, '')} failed: ${err.message}`)
     }
   }
+
+  // Ensure react-native-track-player has compiled lib directory if missing
+  const rntpDir = path.join(rootPath, 'node_modules/react-native-track-player')
+  const rntpLibDir = path.join(rntpDir, 'lib')
+  if (fs.existsSync(rntpDir) && !fs.existsSync(rntpLibDir)) {
+    console.log('Compiling react-native-track-player TypeScript source...')
+    try {
+      const { execSync } = require('node:child_process')
+      execSync('npm run build', { cwd: rntpDir, stdio: 'inherit' })
+      console.log('react-native-track-player built successfully.')
+    } catch (err) {
+      console.error('Failed to build react-native-track-player:', err.message)
+    }
+  }
+
   console.log('\nDependencies patch finished.\n')
 })()
