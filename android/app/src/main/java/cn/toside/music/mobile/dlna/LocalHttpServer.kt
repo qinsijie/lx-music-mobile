@@ -116,7 +116,7 @@ class LocalHttpServer(val port: Int = 8088) {
                 }
 
                 if (method == "GET") {
-                    val isChunked = path.contains("chunked=1") || hasChunkedHeader
+                    val isChunked = path.contains("chunked=1")
                     val wavHeader = createWavHeader(48000, 2, 16)
                     val subscriber = ClientSubscriber(socket, out, isChunked)
 
@@ -132,7 +132,7 @@ class LocalHttpServer(val port: Int = 8088) {
                     }
 
                     subscribers.add(subscriber)
-                    Log.i(tag, "Client subscribed to audio stream (chunked=$isChunked): ${socket.remoteSocketAddress}. Total clients: ${subscribers.size}")
+                    Log.i(tag, "Client subscribed to audio stream (chunked=$isChunked): ${socket.remoteSocketAddress}. 44-byte WAV header sent and flushed immediately. Total clients: ${subscribers.size}")
 
                     // Keep socket open until client disconnects
                     val input = socket.getInputStream()
