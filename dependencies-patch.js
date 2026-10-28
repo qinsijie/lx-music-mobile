@@ -19,11 +19,9 @@ import java.nio.ByteOrder;
 public class DlnaAudioProcessor extends BaseAudioProcessor {
 
     private static final String TAG = "DlnaAudioProcessor";
-    private static final int TARGET_SAMPLE_RATE = 48000;
-    private static final int TARGET_CHANNELS = 2;
-    private static final int TARGET_BYTES_PER_SAMPLE = 2;
 
     public interface AudioDataListener {
+        void onAudioFormat(int sampleRate, int channelCount, int bitsPerSample);
         void onAudioData(byte[] buffer, int offset, int length);
         void onFlush();
     }
@@ -51,7 +49,7 @@ public class DlnaAudioProcessor extends BaseAudioProcessor {
 
     @Override
     public AudioProcessor.AudioFormat onConfigure(AudioProcessor.AudioFormat inputAudioFormat) {
-        Log.i(TAG, "onConfigure: sampleRate=" + inputAudioFormat.sampleRate +
+        Log.i(TAG, "onConfigure (Bit-Perfect): sampleRate=" + inputAudioFormat.sampleRate +
                 ", channels=" + inputAudioFormat.channelCount +
                 ", encoding=" + inputAudioFormat.encoding);
 
@@ -61,12 +59,20 @@ public class DlnaAudioProcessor extends BaseAudioProcessor {
             return AudioProcessor.AudioFormat.NOT_SET;
         }
 
+        // 通知音频规格变更 (例如 44100Hz, 2声道, 16位深)
+        int bitsPerSample = 16;
+        AudioDataListener listener = dataListener;
+        if (listener != null) {
+            listener.onAudioFormat(inputAudioFormat.sampleRate, inputAudioFormat.channelCount, bitsPerSample);
+        }
+
         return inputAudioFormat;
     }
 
     @Override
     protected void onFlush() {
         super.onFlush();
+        Log.i(TAG, "AudioProcessor onFlush() invoked. Notifying listener to clear buffer.");
         AudioDataListener listener = dataListener;
         if (listener != null) {
             listener.onFlush();
@@ -85,71 +91,28 @@ public class DlnaAudioProcessor extends BaseAudioProcessor {
             duplicate.order(ByteOrder.LITTLE_ENDIAN);
             AudioFormat format = inputAudioFormat;
 
-            if (format.encoding == C.ENCODING_PCM_16BIT &&
-                format.sampleRate == TARGET_SAMPLE_RATE &&
-                format.channelCount == TARGET_CHANNELS) {
-                // 完美匹配 48kHz 16-bit 立体声，直接批量提取投递
+            if (format.encoding == C.ENCODING_PCM_16BIT) {
+                // Bit-Perfect 源码直通：100% 原始 PCM 旁路透传，零重采样零插值
                 byte[] pcmBytes = new byte[duplicate.remaining()];
                 duplicate.get(pcmBytes);
                 listener.onAudioData(pcmBytes, 0, pcmBytes.length);
-            } else {
-                // 委托规范声道适配与位深归一化至 48kHz 16-bit 双声道 (采样率已由前置 SonicAudioProcessor 保证)
-                byte[] converted = convertToTargetPcm(duplicate, format);
-                if (converted.length > 0) {
-                    listener.onAudioData(converted, 0, converted.length);
+            } else if (format.encoding == C.ENCODING_PCM_FLOAT) {
+                // Float PCM 归一化为 16-bit PCM，采样率与通道数 100% 保持原样
+                int inChannels = format.channelCount;
+                int totalSamples = duplicate.remaining() / 4;
+                byte[] outBytes = new byte[totalSamples * 2];
+                ByteBuffer outBuf = ByteBuffer.wrap(outBytes).order(ByteOrder.LITTLE_ENDIAN);
+                while (duplicate.remaining() >= 4) {
+                    float f = Math.max(-1.0f, Math.min(1.0f, duplicate.getFloat()));
+                    outBuf.putShort((short) (f * 32767.0f));
                 }
+                listener.onAudioData(outBytes, 0, outBytes.length);
             }
         }
 
         ByteBuffer outputBuffer = replaceOutputBuffer(remaining);
         outputBuffer.put(inputBuffer);
         outputBuffer.flip();
-    }
-
-    private byte[] convertToTargetPcm(ByteBuffer buffer, AudioFormat format) {
-        int inChannels = format.channelCount;
-        boolean isFloat = format.encoding == C.ENCODING_PCM_FLOAT;
-        int bytesPerSample = isFloat ? 4 : 2;
-        int totalInFrames = buffer.remaining() / (inChannels * bytesPerSample);
-        if (totalInFrames <= 0) return new byte[0];
-
-        byte[] outBytes = new byte[totalInFrames * TARGET_CHANNELS * TARGET_BYTES_PER_SAMPLE];
-        ByteBuffer outBuf = ByteBuffer.wrap(outBytes).order(ByteOrder.LITTLE_ENDIAN);
-
-        while (buffer.remaining() >= inChannels * bytesPerSample) {
-            short left;
-            if (isFloat) {
-                float f = Math.max(-1.0f, Math.min(1.0f, buffer.getFloat()));
-                left = (short) (f * 32767.0f);
-            } else {
-                left = buffer.getShort();
-            }
-
-            short right;
-            if (inChannels >= 2) {
-                if (isFloat) {
-                    float f = Math.max(-1.0f, Math.min(1.0f, buffer.getFloat()));
-                    right = (short) (f * 32767.0f);
-                } else {
-                    right = buffer.getShort();
-                }
-            } else {
-                right = left;
-            }
-
-            if (inChannels > 2) {
-                for (int ch = 2; ch < inChannels; ch++) {
-                    if (buffer.remaining() >= bytesPerSample) {
-                        if (isFloat) buffer.getFloat(); else buffer.getShort();
-                    }
-                }
-            }
-
-            outBuf.putShort(left);
-            outBuf.putShort(right);
-        }
-
-        return outBytes;
     }
 
     @Override
@@ -189,7 +152,7 @@ const patchTrackPlayer = async() => {
       console.warn('Could not find audioOffload pattern in MusicManager.java!')
     }
 
-    // Replace DefaultRenderersFactory instantiation with custom AudioSink builder (inserting SonicAudioProcessor for high-quality 48kHz resampling)
+    // Replace DefaultRenderersFactory instantiation with custom AudioSink builder (Bit-Perfect direct pipeline, zero resampling)
     const rfPattern = 'DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory(service);'
     const rfReplacement = `DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory(service) {
             @Override
@@ -197,27 +160,21 @@ const patchTrackPlayer = async() => {
                     Context context,
                     boolean enableFloatOutput,
                     boolean enableAudioTrackPlaybackParams) {
-                android.util.Log.i("DlnaAudioProcessor", "buildAudioSink invoked in MusicManager!");
-                androidx.media3.common.audio.SonicAudioProcessor sonic = new androidx.media3.common.audio.SonicAudioProcessor();
-                sonic.setOutputSampleRateHz(48000);
+                android.util.Log.i("DlnaAudioProcessor", "buildAudioSink invoked in MusicManager (Bit-Perfect direct pipeline)!");
                 return new androidx.media3.exoplayer.audio.DefaultAudioSink.Builder(context)
                         .setEnableFloatOutput(false)
                         .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
-                        .setAudioProcessors(new androidx.media3.common.audio.AudioProcessor[]{ sonic, DlnaAudioProcessor.getInstance() })
+                        .setAudioProcessors(new androidx.media3.common.audio.AudioProcessor[]{ DlnaAudioProcessor.getInstance() })
                         .build();
             }
         };`
 
-    if (content.includes('buildAudioSink invoked in MusicManager!')) {
-      if (!content.includes('SonicAudioProcessor')) {
-        content = content.replace(
-          /DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory\(service\) \{[\s\S]*?build\(\);\s*\}\s*\};/,
-          rfReplacement
-        )
-        console.log('Updated DefaultRenderersFactory with SonicAudioProcessor in MusicManager.java.')
-      } else {
-        console.log('DefaultRenderersFactory already patched with SonicAudioProcessor.')
-      }
+    if (content.includes('buildAudioSink invoked in MusicManager')) {
+      content = content.replace(
+        /DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory\(service\) \{[\s\S]*?build\(\);\s*\}\s*\};/,
+        rfReplacement
+      )
+      console.log('Updated DefaultRenderersFactory with Bit-Perfect DlnaAudioProcessor in MusicManager.java.')
     } else if (content.includes(rfPattern)) {
       content = content.replace(rfPattern, rfReplacement)
       console.log('Patched DefaultRenderersFactory in MusicManager.java.')
@@ -237,7 +194,7 @@ const patchTrackPlayer = async() => {
 
     // Assertion check
     const verified = (await fs.promises.readFile(musicManagerPath, 'utf8')).toString()
-    if (!verified.includes('DlnaAudioProcessor.getInstance()') || !verified.includes('SonicAudioProcessor') || !verified.includes('shouldEnableAudioOffload = false')) {
+    if (!verified.includes('DlnaAudioProcessor.getInstance()') || !verified.includes('shouldEnableAudioOffload = false')) {
       throw new Error('CRITICAL ASSERTION FAILED: MusicManager.java patch verification failed!')
     }
     console.log('MusicManager.java patch verified successfully.')

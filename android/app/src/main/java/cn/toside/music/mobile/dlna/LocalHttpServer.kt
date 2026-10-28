@@ -124,7 +124,12 @@ class PcmRingBuffer(val capacity: Int = 288000) {
  * - 内置高精度单调时钟匀速发包器 (Streaming Pacer)，每 10ms 恒定推送 1920 字节 (严格 192,000 字节/秒)
  * - 静音垫片出队即时融合，真实音乐无延迟零残留输出
  */
-class LocalHttpServer(val port: Int = 8088) {
+class LocalHttpServer(
+    val port: Int = 8088,
+    @Volatile var sampleRate: Int = 44100,
+    @Volatile var channels: Int = 2,
+    @Volatile var bitsPerSample: Int = 16
+) {
 
     private val tag = "LocalHttpServer"
     private var serverSocket: ServerSocket? = null
@@ -141,12 +146,8 @@ class LocalHttpServer(val port: Int = 8088) {
     private val subscribers = CopyOnWriteArrayList<ClientSubscriber>()
     private val crlf = "\r\n".toByteArray(Charsets.US_ASCII)
 
-    // 环形缓冲与高精度时钟匀速发包器
-    private val ringBuffer = PcmRingBuffer(288000) // 1.5 秒缓冲池 (288,000 字节，给 ExoPlayer 充分突发解码空间)
-    private val BYTES_PER_SECOND = 192000L // 48000 * 2 * 2 (16-bit stereo)
-    private val CHUNK_BYTES = 3840 // 20ms 一包 (960 采样帧)
-    private val LEAD_BUFFER_BYTES = 76800L // 维持 400ms 弹性平滑跑道 (192,000 * 0.4s = 76,800 字节，抗 DSD128 重度上采样与空口微休眠)
-    private val MAX_CATCHUP_BYTES = 192000L // 最大允许追赶 1000ms，超过则重置时钟，防止系统睡眠唤醒后海啸倾泻
+    // 环形缓冲与高精度时钟匀速发包器 (深度 384,000 字节，容纳 ~2.2s 44.1k 或 ~1s 96k 充足解码缓冲)
+    private val ringBuffer = PcmRingBuffer(384000)
     private val pacerLock = java.lang.Object()
     private var pacerThread: Thread? = null
 
@@ -157,6 +158,39 @@ class LocalHttpServer(val port: Int = 8088) {
      * 客户端断开连接或 Broken pipe 回调通知
      */
     var onClientDisconnected: ((reason: String) -> Unit)? = null
+
+    fun getByteRate(): Long = sampleRate.toLong() * channels * (bitsPerSample / 8)
+
+    fun getChunkBytes(): Int {
+        val frameSize = channels * (bitsPerSample / 8)
+        val framesIn20ms = (sampleRate * 20) / 1000
+        return framesIn20ms * frameSize
+    }
+
+    fun getLeadBufferBytes(): Long = (getByteRate() * 400L) / 1000L
+
+    fun getMaxCatchupBytes(): Long = getByteRate() * 1L
+
+    fun updateAudioFormat(newSampleRate: Int, newChannels: Int, newBitsPerSample: Int) {
+        val changed = sampleRate != newSampleRate || channels != newChannels || bitsPerSample != newBitsPerSample
+        sampleRate = newSampleRate
+        channels = newChannels
+        bitsPerSample = newBitsPerSample
+        if (changed) {
+            Log.i(tag, "LocalHttpServer audio format updated to ${newSampleRate}Hz, ${channels}ch, ${bitsPerSample}bit")
+            synchronized(pacerLock) {
+                pacerLock.notifyAll()
+            }
+        }
+    }
+
+    fun closeClients() {
+        for (subscriber in subscribers) {
+            subscriber.isClosedManually = true
+            try { subscriber.socket.close() } catch (_: Exception) {}
+        }
+        subscribers.clear()
+    }
 
     @Synchronized
     fun start(): Boolean {
@@ -242,16 +276,18 @@ class LocalHttpServer(val port: Int = 8088) {
 
                 if (method == "GET") {
                     val isChunked = path.contains("chunked=1")
-                    val wavHeader = createWavHeader(48000, 2, 16)
-                    val silencePreBuffer = ByteArray(76800) // 400ms 48000Hz 16-bit 双声道 PCM 静音首包预填充 (76,800 字节)
+                    val curSr = sampleRate
+                    val curCh = channels
+                    val curBits = bitsPerSample
+                    val curByteRate = curSr.toLong() * curCh * (curBits / 8)
+                    val leadBytes = ((curByteRate * 400L) / 1000L).toInt()
+
+                    val wavHeader = createWavHeader(curSr, curCh, curBits)
+                    val silencePreBuffer = ByteArray(leadBytes)
                     val subscriber = ClientSubscriber(socket, out, isChunked)
 
                     // 先标记并清理已有旧连接 (主动关闭不触发 onClientDisconnected 级联销毁)
-                    for (oldSub in subscribers) {
-                        oldSub.isClosedManually = true
-                        try { oldSub.socket.close() } catch (_: Exception) {}
-                    }
-                    subscribers.clear()
+                    closeClients()
                     ringBuffer.clear()
 
                     // 先写响应头、44 字节实时 WAV 头与 400ms 首包预填充并立即 flush
@@ -268,12 +304,12 @@ class LocalHttpServer(val port: Int = 8088) {
 
                     subscribers.add(subscriber)
                     streamStartTimeNanos = System.nanoTime()
-                    totalBytesSent = 76800L // 初始已有 400ms 写入内核 Socket 形成平滑弹性跑道
+                    totalBytesSent = leadBytes.toLong() // 初始已有 400ms 写入内核 Socket 形成平滑弹性跑道
 
                     synchronized(pacerLock) {
                         pacerLock.notifyAll()
                     }
-                    Log.i(tag, "Client subscribed to audio stream: ${socket.remoteSocketAddress}. 44-byte WAV header and 400ms silence lead-buffer sent and flushed. Pipeline is ACTIVE.")
+                    Log.i(tag, "Client subscribed to audio stream ($curSr Hz $curCh ch $curBits bit): ${socket.remoteSocketAddress}. 44-byte WAV header and ${leadBytes}B silence lead-buffer sent and flushed. Pipeline is ACTIVE.")
                     return
                 }
             }
@@ -301,8 +337,8 @@ class LocalHttpServer(val port: Int = 8088) {
         } catch (e: Exception) {
             Log.w(tag, "Failed to set THREAD_PRIORITY_AUDIO for StreamingPacer: ${e.message}")
         }
-        Log.i(tag, "Streaming Pacer thread started with THREAD_PRIORITY_AUDIO (nanoTime drift-compensated pacing with 400ms lead buffer)")
-        val sendBuffer = ByteArray(CHUNK_BYTES)
+        Log.i(tag, "Streaming Pacer thread started with THREAD_PRIORITY_AUDIO (Bit-Perfect nanoTime drift-compensated pacing with 400ms lead buffer)")
+        var sendBuffer = ByteArray(getChunkBytes())
 
         // 1秒轻量级聚合诊断打点变量
         var diagLastLogNanos = System.nanoTime()
@@ -326,26 +362,40 @@ class LocalHttpServer(val port: Int = 8088) {
                     if (!isRunning.get()) break
                 }
 
+                // 动态自适应当前音轨规格参数 (通用物理公式)
+                val curSr = sampleRate
+                val curCh = channels
+                val curBits = bitsPerSample
+                val frameSize = curCh * (curBits / 8)
+                val curByteRate = curSr.toLong() * frameSize
+                val curChunkBytes = ((curSr * 20) / 1000) * frameSize
+                val curLeadBytes = (curByteRate * 400L) / 1000L
+                val curMaxCatchup = curByteRate * 1L
+
+                if (sendBuffer.size != curChunkBytes) {
+                    sendBuffer = ByteArray(curChunkBytes)
+                }
+
                 val now = System.nanoTime()
                 val elapsedNanos = (now - streamStartTimeNanos).coerceAtLeast(0L)
                 // 物理时间轴应当达到的水位 = 实际流逝时间对应的字节数 + 400ms 弹性领先跑道
-                val targetBytes = (elapsedNanos * BYTES_PER_SECOND) / 1_000_000_000L + LEAD_BUFFER_BYTES
+                val targetBytes = (elapsedNanos * curByteRate) / 1_000_000_000L + curLeadBytes
 
                 // 若系统休眠或调度导致落后超过 1000ms，重置时钟锚点，杜绝突发追赶倾泻 (Burst Catch-up)
-                if (targetBytes - totalBytesSent > MAX_CATCHUP_BYTES) {
+                if (targetBytes - totalBytesSent > curMaxCatchup) {
                     streamStartTimeNanos = now
-                    totalBytesSent = LEAD_BUFFER_BYTES
+                    totalBytesSent = curLeadBytes
                     continue
                 }
 
                 // 1. 纳秒级误差累积补偿：若当前发送量落后于 targetBytes，以 20ms 包为粒度连续发包追齐水位
                 var sentInThisTick = false
                 while (totalBytesSent < targetBytes && isRunning.get() && subscribers.isNotEmpty()) {
-                    val hasRealAudio = ringBuffer.read(sendBuffer, 0, CHUNK_BYTES)
+                    val hasRealAudio = ringBuffer.read(sendBuffer, 0, curChunkBytes)
                     if (!hasRealAudio) {
                         sendBuffer.fill(0)
                         diagSilenceChunks++
-                        diagSilenceBytes += CHUNK_BYTES
+                        diagSilenceBytes += curChunkBytes
                     } else {
                         diagRealChunks++
                     }
@@ -353,9 +403,9 @@ class LocalHttpServer(val port: Int = 8088) {
                     for (subscriber in subscribers) {
                         try {
                             if (subscriber.isChunked) {
-                                sendChunk(subscriber.outputStream, sendBuffer, 0, CHUNK_BYTES)
+                                sendChunk(subscriber.outputStream, sendBuffer, 0, curChunkBytes)
                             } else {
-                                subscriber.outputStream.write(sendBuffer, 0, CHUNK_BYTES)
+                                subscriber.outputStream.write(sendBuffer, 0, curChunkBytes)
                             }
                         } catch (e: Exception) {
                             Log.w(tag, "Pacer write exception (${e.javaClass.simpleName}: ${e.message}), removing client ${subscriber.socket.remoteSocketAddress}")
@@ -366,8 +416,8 @@ class LocalHttpServer(val port: Int = 8088) {
                             }
                         }
                     }
-                    totalBytesSent += CHUNK_BYTES
-                    diagBytesSent += CHUNK_BYTES
+                    totalBytesSent += curChunkBytes
+                    diagBytesSent += curChunkBytes
                     sentInThisTick = true
                 }
 
@@ -383,11 +433,11 @@ class LocalHttpServer(val port: Int = 8088) {
                 // 2. 高精度休眠节流：计算领先字节量与对应的等待时长
                 val curNow = System.nanoTime()
                 val curElapsed = (curNow - streamStartTimeNanos).coerceAtLeast(0L)
-                val curExpected = (curElapsed * BYTES_PER_SECOND) / 1_000_000_000L + LEAD_BUFFER_BYTES
+                val curExpected = (curElapsed * curByteRate) / 1_000_000_000L + curLeadBytes
                 val aheadBytes = totalBytesSent - curExpected
 
                 if (aheadBytes > 0) {
-                    val waitNanos = (aheadBytes * 1_000_000_000L) / BYTES_PER_SECOND
+                    val waitNanos = (aheadBytes * 1_000_000_000L) / curByteRate
                     val sleepMs = waitNanos / 1_000_000L
                     if (sleepMs > 2L) {
                         // 预留 2ms 冗余以抵抗 Android 线程休眠漂移超标，剩余毫秒以微睡眠等待
@@ -408,20 +458,21 @@ class LocalHttpServer(val port: Int = 8088) {
                     val inSpeedKb = (inBytes / diagElapsedSec) / 1024.0
 
                     val ringAvailBytes = ringBuffer.available()
-                    val ringAvailMs = (ringAvailBytes * 1000L) / BYTES_PER_SECOND
+                    val ringAvailMs = (ringAvailBytes * 1000L) / curByteRate
 
-                    val targetNanos = ((totalBytesSent - LEAD_BUFFER_BYTES) * 1_000_000_000L) / BYTES_PER_SECOND
+                    val targetNanos = ((totalBytesSent - curLeadBytes) * 1_000_000_000L) / curByteRate
                     val actualElapsedNanos = diagNow - streamStartTimeNanos
                     val driftMs = (actualElapsedNanos - targetNanos) / 1_000_000.0
 
-                    val leadBytes = (totalBytesSent - ((diagNow - streamStartTimeNanos) * BYTES_PER_SECOND / 1_000_000_000L)).coerceAtLeast(0L)
-                    val leadMs = (leadBytes * 1000L) / BYTES_PER_SECOND
+                    val leadBytes = (totalBytesSent - ((diagNow - streamStartTimeNanos) * curByteRate / 1_000_000_000L)).coerceAtLeast(0L)
+                    val leadMs = (leadBytes * 1000L) / curByteRate
 
                     val droppedBytes = ringBuffer.getTotalDroppedBytes()
 
                     Log.i("DLNA-PACER-DIAG", String.format(
                         java.util.Locale.US,
-                        "[DLNA-PACER-DIAG] Speed: %.1f KB/s (In: %.1f KB/s) | RingBuffer: %dms (%dB) | Underrun: %d pkts (%dB) | LeadBuffer: %dms | Drift: %+.1fms | Dropped: %dB",
+                        "[DLNA-PACER-DIAG] [%dHz %dch %dbit] Speed: %.1f KB/s (In: %.1f KB/s) | RingBuffer: %dms (%dB) | Underrun: %d pkts (%dB) | LeadBuffer: %dms | Drift: %+.1fms | Dropped: %dB",
+                        curSr, curCh, curBits,
                         speedKb, inSpeedKb, ringAvailMs, ringAvailBytes, diagSilenceChunks, diagSilenceBytes, leadMs, driftMs, droppedBytes
                     ))
 

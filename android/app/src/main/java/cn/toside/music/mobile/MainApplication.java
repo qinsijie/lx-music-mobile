@@ -69,6 +69,11 @@ public class MainApplication extends NavigationApplication {
     com.guichaguri.trackplayer.service.DlnaAudioProcessor.setListener(
         new com.guichaguri.trackplayer.service.DlnaAudioProcessor.AudioDataListener() {
             @Override
+            public void onAudioFormat(int sampleRate, int channelCount, int bitsPerSample) {
+                cn.toside.music.mobile.dlna.DlnaManager.INSTANCE.setAudioFormat(sampleRate, channelCount, bitsPerSample);
+            }
+
+            @Override
             public void onAudioData(byte[] buffer, int offset, int length) {
                 cn.toside.music.mobile.dlna.DlnaManager.INSTANCE.writePcmData(buffer, offset, length);
             }

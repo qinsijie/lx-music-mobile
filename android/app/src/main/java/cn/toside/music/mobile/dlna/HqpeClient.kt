@@ -29,8 +29,14 @@ object HqpeClient {
         .writeTimeout(15, TimeUnit.SECONDS)
         .build()
 
-    suspend fun setUri(controlUrl: String, streamUrl: String): Result<Unit> = withContext(Dispatchers.IO) {
-        setUriSync(controlUrl, streamUrl)
+    suspend fun setUri(
+        controlUrl: String,
+        streamUrl: String,
+        sampleRate: Int = 44100,
+        channels: Int = 2,
+        bitsPerSample: Int = 16
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        setUriSync(controlUrl, streamUrl, sampleRate, channels, bitsPerSample)
     }
 
     suspend fun play(controlUrl: String): Result<Unit> = withContext(Dispatchers.IO) {
@@ -41,13 +47,19 @@ object HqpeClient {
         stopSync(controlUrl)
     }
 
-    fun setUriSync(controlUrl: String, streamUrl: String): Result<Unit> {
+    fun setUriSync(
+        controlUrl: String,
+        streamUrl: String,
+        sampleRate: Int = 44100,
+        channels: Int = 2,
+        bitsPerSample: Int = 16
+    ): Result<Unit> {
         val didlLite = """<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
   <item id="1" parentID="0" restricted="1">
     <dc:title>LX Music Live Stream</dc:title>
     <dc:creator>LX Music</dc:creator>
     <upnp:class>object.item.audioItem.musicTrack</upnp:class>
-    <res protocolInfo="http-get:*:audio/wav:*" duration="03:00:00.000" sampleFrequency="48000" nrAudioChannels="2" bitsPerSample="16">$streamUrl</res>
+    <res protocolInfo="http-get:*:audio/wav:*" duration="03:00:00.000" sampleFrequency="$sampleRate" nrAudioChannels="$channels" bitsPerSample="$bitsPerSample">$streamUrl</res>
   </item>
 </DIDL-Lite>"""
 

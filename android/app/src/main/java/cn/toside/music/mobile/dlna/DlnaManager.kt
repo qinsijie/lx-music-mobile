@@ -53,6 +53,12 @@ object DlnaManager {
     private val currentState = AtomicReference(DlnaState.IDLE)
     private var eventListener: DlnaEventListener? = null
 
+    // 音频规格动态追踪 (Bit-Perfect 源码直通)
+    @Volatile private var currentSampleRate = 44100
+    @Volatile private var currentChannels = 2
+    @Volatile private var currentBitsPerSample = 16
+    private var appContext: Context? = null
+
     // 系统级高性能保活锁 (防止三星等系统后台 Wi-Fi 微休眠与 CPU 降频)
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -169,6 +175,7 @@ object DlnaManager {
         // 2. 原子取消先前尚未执行完的旧异步任务，杜绝旧请求飘到新会话中
         activeSessionJob?.cancel()
 
+        appContext = context.applicationContext
         updateState(DlnaState.CONNECTING)
 
         val job = scope.launch {
@@ -186,11 +193,14 @@ object DlnaManager {
                     }
                     currentDevice = device
 
-                    // 4. 重启或启动本地 HTTP 推流服务
+                    // 4. 重启或启动本地 HTTP 推流服务 (Bit-Perfect 动态音轨自适应)
                     localHttpServer?.stop()
                     localHttpServer = null
 
-                    val server = LocalHttpServer(port)
+                    val sr = currentSampleRate
+                    val ch = currentChannels
+                    val bits = currentBitsPerSample
+                    val server = LocalHttpServer(port, sr, ch, bits)
                     server.onClientDisconnected = { reason ->
                         Log.w(TAG, "LocalHttpServer client disconnected ($reason).")
                         scope.launch {
@@ -215,10 +225,10 @@ object DlnaManager {
                     // 5. 纯净标准时序：解析本机 IP -> SetAVTransportURI -> (成功后) -> Play
                     val localIp = NetworkUtils.getLocalIpAddress(context, device.ip, device.port)
                     val streamUrl = "http://$localIp:$port/stream.wav"
-                    Log.i(TAG, "Initiating stream to ${device.friendlyName} via $streamUrl (standard sequence)")
+                    Log.i(TAG, "Initiating stream to ${device.friendlyName} via $streamUrl ($sr Hz $ch ch $bits bit standard sequence)")
 
-                    // a) 执行 SOAP SetAVTransportURI
-                    val setUriResult = HqpeClient.setUri(device.controlUrl, streamUrl)
+                    // a) 执行 SOAP SetAVTransportURI (携带动态自适应 sampleFrequency 元数据)
+                    val setUriResult = HqpeClient.setUri(device.controlUrl, streamUrl, sr, ch, bits)
                     if (setUriResult.isFailure) {
                         val err = setUriResult.exceptionOrNull()?.message ?: "未知错误"
                         throw IllegalStateException("[SetAVTransportURI 阶段] $err")
@@ -314,6 +324,82 @@ object DlnaManager {
      */
     fun clearPcmBuffer() {
         localHttpServer?.clearBuffer()
+    }
+
+    /**
+     * 动态设置/更新当前音轨规格 (由 ExoPlayer DlnaAudioProcessor 拦截回调)
+     * 若切歌前后采样率一致 (如 44.1k -> 44.1k)，无缝平滑切歌；
+     * 若跨采样率变更 (如 44.1k -> 96k)，自动触发重协商安全重置会话与声卡 DAC 时钟。
+     */
+    fun setAudioFormat(sampleRate: Int, channels: Int, bitsPerSample: Int) {
+        if (sampleRate <= 0 || channels <= 0) return
+        val oldRate = currentSampleRate
+        val oldChannels = currentChannels
+        val oldBits = currentBitsPerSample
+
+        val formatChanged = oldRate != sampleRate || oldChannels != channels || oldBits != bitsPerSample
+
+        currentSampleRate = sampleRate
+        currentChannels = channels
+        currentBitsPerSample = bitsPerSample
+
+        Log.i(TAG, "Audio format set/updated: ${sampleRate}Hz, ${channels}ch, ${bitsPerSample}bit (previous: ${oldRate}Hz, ${oldChannels}ch, ${oldBits}bit, changed=$formatChanged)")
+
+        localHttpServer?.updateAudioFormat(sampleRate, channels, bitsPerSample)
+
+        // 跨采样率切歌保护机制 (Hi-Res 兼容性)
+        if (isStreaming() && formatChanged) {
+            Log.w(TAG, "Audio format changed during streaming (${oldRate}Hz -> ${sampleRate}Hz). Re-negotiating DLNA session for Bit-Perfect DAC clock re-sync...")
+            reNegotiateSession(sampleRate, channels, bitsPerSample)
+        }
+    }
+
+    private fun reNegotiateSession(sampleRate: Int, channels: Int, bitsPerSample: Int) {
+        val device = currentDevice ?: return
+        val server = localHttpServer ?: return
+        val context = appContext ?: return
+
+        scope.launch {
+            operationMutex.withLock {
+                try {
+                    Log.i(TAG, "Starting seamless DLNA session re-negotiation for new format: ${sampleRate}Hz ${channels}ch ${bitsPerSample}bit")
+
+                    // 1. 关闭现有 HTTP 订阅连接并清空 RingBuffer，截断旧规格数据流
+                    server.closeClients()
+                    server.clearBuffer()
+
+                    // 2. 发送 SOAP Stop 重置 HQPE 播放器状态机与 DAC 时钟
+                    try {
+                        HqpeClient.stop(device.controlUrl)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "SOAP Stop during format re-negotiation warning: ${e.message}")
+                    }
+
+                    kotlinx.coroutines.delay(120)
+
+                    // 3. 构建包含新 sampleFrequency 的 DIDL-Lite 下发 SetAVTransportURI
+                    val localIp = NetworkUtils.getLocalIpAddress(context, device.ip, device.port)
+                    val streamUrl = "http://$localIp:${server.port}/stream.wav"
+
+                    val setUriResult = HqpeClient.setUri(device.controlUrl, streamUrl, sampleRate, channels, bitsPerSample)
+                    if (setUriResult.isFailure) {
+                        Log.e(TAG, "Re-negotiation SetAVTransportURI failed: ${setUriResult.exceptionOrNull()?.message}")
+                        return@withLock
+                    }
+
+                    // 4. 下发 Play 恢复推流
+                    val playResult = HqpeClient.play(device.controlUrl)
+                    if (playResult.isFailure) {
+                        Log.e(TAG, "Re-negotiation Play failed: ${playResult.exceptionOrNull()?.message}")
+                        return@withLock
+                    }
+
+                    Log.i(TAG, "DLNA session re-negotiation completed successfully for ${sampleRate}Hz!")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error during format re-negotiation: ${e.message}", e)
+                }
+            }
+        }
     }
 
     private fun updateState(newState: DlnaState, message: String? = null) {
