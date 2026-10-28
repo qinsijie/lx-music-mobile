@@ -2,11 +2,14 @@ package cn.toside.music.mobile.dlna
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -33,12 +36,16 @@ interface DlnaEventListener {
 /**
  * DLNA 核心管理器
  * 统一调度 LocalHttpServer、HqpeClient、SsdpScanner 与 NetworkUtils
+ * 具备协程互斥锁 (Mutex) 与严格防竞态序列控制
  */
 object DlnaManager {
     private const val TAG = "DlnaManager"
     private const val DEFAULT_PORT = 8088
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val operationMutex = Mutex()
+    private var activeSessionJob: Job? = null
+
     private var localHttpServer: LocalHttpServer? = null
     private var currentDevice: DlnaDevice? = null
     private val currentState = AtomicReference(DlnaState.IDLE)
@@ -84,133 +91,154 @@ object DlnaManager {
 
     /**
      * 连接至指定的 DLNA 渲染设备并启动串流
-     * 包含投送发起前的“强行复位与解卡死机制”（彻底根除 701）
+     * 遵循纯净标准时序：SetAVTransportURI -> (成功后) -> Play
+     * 使用 Mutex 锁定操作，严禁投送前盲目调用 Stop，彻底根除时序竞态与自身误杀
      */
     fun startStreaming(context: Context, device: DlnaDevice, port: Int = DEFAULT_PORT, callback: ((Boolean, String?) -> Unit)? = null) {
-        // 1. 防重复投送：若已经在向同一设备推流中且底层活跃，直接复用连接
+        // 1. 防重复投送保护
         val isAlreadyStreaming = currentState.get() == DlnaState.STREAMING
         val isSameDevice = currentDevice?.id == device.id ||
                 (currentDevice?.ip == device.ip && currentDevice?.controlUrl == device.controlUrl)
         val isServerActive = localHttpServer?.isRunning() == true && (localHttpServer?.getClientCount() ?: 0) > 0
 
         if (isAlreadyStreaming && isSameDevice && isServerActive) {
-            Log.i(TAG, "Already actively streaming to device ${device.friendlyName} (${device.ip}). Guarding against duplicate startStreaming.")
+            Log.i(TAG, "Already actively streaming to ${device.friendlyName}. Guarding against duplicate startStreaming.")
             callback?.invoke(true, null)
             return
         }
 
-        // 2. 标记状态为 CONNECTING
+        // 2. 原子取消先前尚未执行完的旧异步任务，杜绝旧请求飘到新会话中
+        activeSessionJob?.cancel()
+
         updateState(DlnaState.CONNECTING)
-        currentDevice = device
 
-        scope.launch {
-            try {
-                // 3. 投送发起前的“强行复位与解卡死机制”：
-                // 无论 HQPE 当前是否处于卡死态或中间态，先发送一次 SOAP Stop 强制复位，忽略可能的 701 报错
-                Log.i(TAG, "Pre-resetting target device ${device.friendlyName} via SOAP Stop before SetAVTransportURI...")
-                val preStopResult = HqpeClient.stop(device.controlUrl)
-                if (preStopResult.isFailure) {
-                    Log.w(TAG, "Pre-reset SOAP Stop warning (safely ignored): ${preStopResult.exceptionOrNull()?.message}")
-                } else {
-                    Log.i(TAG, "Pre-reset SOAP Stop accepted by ${device.friendlyName}.")
-                }
-
-                // 延时 150ms 确保 HQPE 彻底平稳复位至 STOPPED 态，杜绝 Transition not available
-                delay(150)
-
-                // 4. 重建或启动本地 HTTP 推流服务
-                localHttpServer?.stop()
-                localHttpServer = null
-
-                val server = LocalHttpServer(port)
-                server.onClientDisconnected = { reason ->
-                    Log.w(TAG, "LocalHttpServer client disconnected ($reason). Resetting state to IDLE immediately.")
-                    scope.launch {
-                        localHttpServer?.stop()
-                        localHttpServer = null
-                        currentDevice = null
-                        updateState(DlnaState.IDLE, "DISCONNECTED")
+        val job = scope.launch {
+            operationMutex.withLock {
+                try {
+                    // 3. 切换目标设备时，才显式向旧设备发送 Stop 释放旧声卡
+                    val oldDevice = currentDevice
+                    if (oldDevice != null && (oldDevice.id != device.id || oldDevice.ip != device.ip)) {
+                        Log.i(TAG, "Switching device: stopping previous device ${oldDevice.friendlyName} first...")
+                        try {
+                            HqpeClient.stop(oldDevice.controlUrl)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to stop previous device: ${e.message}")
+                        }
                     }
+                    currentDevice = device
+
+                    // 4. 重启或启动本地 HTTP 推流服务
+                    localHttpServer?.stop()
+                    localHttpServer = null
+
+                    val server = LocalHttpServer(port)
+                    server.onClientDisconnected = { reason ->
+                        Log.w(TAG, "LocalHttpServer client disconnected ($reason).")
+                        scope.launch {
+                            operationMutex.withLock {
+                                if (currentState.get() == DlnaState.STREAMING) {
+                                    localHttpServer?.stop()
+                                    localHttpServer = null
+                                    currentDevice = null
+                                    updateState(DlnaState.IDLE, "DISCONNECTED")
+                                }
+                            }
+                        }
+                    }
+
+                    if (!server.start()) {
+                        throw IllegalStateException("Failed to bind LocalHttpServer on port $port")
+                    }
+                    localHttpServer = server
+                    localHttpServer?.clearBuffer()
+
+                    // 5. 纯净标准时序：解析本机 IP -> SetAVTransportURI -> (成功后) -> Play
+                    val localIp = NetworkUtils.getLocalIpAddress(context, device.ip, device.port)
+                    val streamUrl = "http://$localIp:$port/stream.wav"
+                    Log.i(TAG, "Initiating stream to ${device.friendlyName} via $streamUrl (standard sequence)")
+
+                    // a) 执行 SOAP SetAVTransportURI
+                    val setUriResult = HqpeClient.setUri(device.controlUrl, streamUrl)
+                    if (setUriResult.isFailure) {
+                        val err = setUriResult.exceptionOrNull()?.message ?: "未知错误"
+                        throw IllegalStateException("[SetAVTransportURI 阶段] $err")
+                    }
+
+                    // b) 执行 SOAP Play
+                    val playResult = HqpeClient.play(device.controlUrl)
+                    if (playResult.isFailure) {
+                        val err = playResult.exceptionOrNull()?.message ?: "未知错误"
+                        throw IllegalStateException("[Play 阶段] $err")
+                    }
+
+                    // c) 确认收到 Play 成功报文后，激活 STREAMING 状态
+                    updateState(DlnaState.STREAMING)
+                    Log.i(TAG, "Successfully started streaming to ${device.friendlyName}")
+                    callback?.invoke(true, null)
+
+                } catch (e: Exception) {
+                    if (e is CancellationException) {
+                        Log.i(TAG, "startStreaming job was cancelled by a newer request.")
+                        return@withLock
+                    }
+                    Log.e(TAG, "startStreaming error: ${e.message}", e)
+                    currentDevice = null
+                    localHttpServer?.stop()
+                    localHttpServer = null
+                    updateState(DlnaState.IDLE, "ERROR: ${e.message}")
+                    eventListener?.onError(e.message ?: "Streaming error")
+                    callback?.invoke(false, e.message)
                 }
-
-                if (!server.start()) {
-                    throw IllegalStateException("Failed to bind LocalHttpServer on port $port")
-                }
-                localHttpServer = server
-                localHttpServer?.clearBuffer()
-
-                // 5. 解析面向目标设备 IP 的精准本机 IP (规避 VPN/虚拟网卡)
-                val localIp = NetworkUtils.getLocalIpAddress(context, device.ip, device.port)
-                val streamUrl = "http://$localIp:$port/stream.wav"
-                Log.i(TAG, "Target stream URL prepared: $streamUrl for device ${device.friendlyName}")
-
-                // 6. 执行 SOAP SetAVTransportURI
-                val setUriResult = HqpeClient.setUri(device.controlUrl, streamUrl)
-                if (setUriResult.isFailure) {
-                    val err = setUriResult.exceptionOrNull()?.message ?: "未知错误"
-                    throw IllegalStateException("[SetAVTransportURI 阶段] $err")
-                }
-
-                // 7. 执行 SOAP Play
-                val playResult = HqpeClient.play(device.controlUrl)
-                if (playResult.isFailure) {
-                    val err = playResult.exceptionOrNull()?.message ?: "未知错误"
-                    throw IllegalStateException("[Play 阶段] $err")
-                }
-
-                // 8. 成功下发 Play 并进入播放管道后，激活 STREAMING 状态
-                updateState(DlnaState.STREAMING)
-                Log.i(TAG, "Successfully started streaming to ${device.friendlyName} via $streamUrl")
-                callback?.invoke(true, null)
-
-            } catch (e: Exception) {
-                Log.e(TAG, "startStreaming error: ${e.message}", e)
-                currentDevice = null
-                localHttpServer?.stop()
-                localHttpServer = null
-                updateState(DlnaState.IDLE, "ERROR: ${e.message}")
-                eventListener?.onError(e.message ?: "Streaming initiation error")
-                callback?.invoke(false, e.message)
             }
         }
+        activeSessionJob = job
     }
 
     /**
      * 规范主动停止串流：
-     * 必须严格“先向 HQPE 发送 SOAP Stop 指令”，等待确认完成释放声卡，再关闭 LocalHttpServer 和 Pacer 线程
+     * 仅在用户主动点击“断开”时显式调用，受 Mutex 保护
      */
     fun stopStreaming(callback: ((Boolean, String?) -> Unit)? = null) {
+        // 原子取消正在排队或执行的启动任务
+        activeSessionJob?.cancel()
+
         val targetDevice = currentDevice
-        scope.launch {
-            try {
-                // 1. 严格先向 HQPE 发送 SOAP Stop 指令
-                if (targetDevice != null) {
-                    Log.i(TAG, "Sending SOAP Stop to ${targetDevice.friendlyName} (${targetDevice.controlUrl})...")
-                    val stopResult = HqpeClient.stop(targetDevice.controlUrl)
-                    if (stopResult.isFailure) {
-                        Log.w(TAG, "SOAP Stop completed with warning: ${stopResult.exceptionOrNull()?.message}")
-                    } else {
-                        Log.i(TAG, "SOAP Stop successfully executed on remote device.")
+        val job = scope.launch {
+            operationMutex.withLock {
+                try {
+                    // 1. 用户主动点击断开时，显式向目标设备发送 SOAP Stop
+                    if (targetDevice != null) {
+                        Log.i(TAG, "Explicitly sending SOAP Stop to ${targetDevice.friendlyName} (${targetDevice.controlUrl})...")
+                        val stopResult = HqpeClient.stop(targetDevice.controlUrl)
+                        if (stopResult.isFailure) {
+                            Log.w(TAG, "SOAP Stop completed with warning: ${stopResult.exceptionOrNull()?.message}")
+                        } else {
+                            Log.i(TAG, "SOAP Stop executed successfully on remote device.")
+                        }
                     }
+
+                    // 2. 停止本地 HTTP 服务与 Pacer 线程
+                    localHttpServer?.stop()
+                    localHttpServer = null
+                    currentDevice = null
+
+                    updateState(DlnaState.STOPPED)
+                    updateState(DlnaState.IDLE)
+                    callback?.invoke(true, null)
+                } catch (e: Exception) {
+                    if (e is CancellationException) {
+                        return@withLock
+                    }
+                    Log.e(TAG, "stopStreaming error: ${e.message}", e)
+                    localHttpServer?.stop()
+                    localHttpServer = null
+                    currentDevice = null
+                    updateState(DlnaState.IDLE)
+                    callback?.invoke(false, e.message)
                 }
-
-                // 2. 确认后再关闭 LocalHttpServer 和 Pacer 线程
-                localHttpServer?.stop()
-                localHttpServer = null
-                currentDevice = null
-
-                updateState(DlnaState.STOPPED)
-                updateState(DlnaState.IDLE)
-                callback?.invoke(true, null)
-            } catch (e: Exception) {
-                Log.e(TAG, "stopStreaming error: ${e.message}", e)
-                localHttpServer?.stop()
-                localHttpServer = null
-                currentDevice = null
-                updateState(DlnaState.IDLE)
-                callback?.invoke(false, e.message)
             }
         }
+        activeSessionJob = job
     }
 
     /**
