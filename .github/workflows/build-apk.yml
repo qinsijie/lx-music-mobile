@@ -37,6 +37,7 @@ jobs:
         run: |
           test -f node_modules/react-native-track-player/android/src/main/java/com/guichaguri/trackplayer/service/DlnaAudioProcessor.java
           grep -n "DlnaAudioProcessor" node_modules/react-native-track-player/android/src/main/java/com/guichaguri/trackplayer/service/MusicManager.java
+          grep -n "SonicAudioProcessor" node_modules/react-native-track-player/android/src/main/java/com/guichaguri/trackplayer/service/MusicManager.java
           grep -n "shouldEnableAudioOffload = false" node_modules/react-native-track-player/android/src/main/java/com/guichaguri/trackplayer/service/MusicManager.java
           echo "All DLNA patches verified successfully!"
 

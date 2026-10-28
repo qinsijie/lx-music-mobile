@@ -18,6 +18,7 @@ class DlnaModule(private val reactContext: ReactApplicationContext) :
 
     override fun onCatalystInstanceDestroy() {
         super.onCatalystInstanceDestroy()
+        DlnaManager.stopStreaming()
         DlnaManager.setEventListener(null)
     }
 

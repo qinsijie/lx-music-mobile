@@ -72,6 +72,11 @@ public class MainApplication extends NavigationApplication {
             public void onAudioData(byte[] buffer, int offset, int length) {
                 cn.toside.music.mobile.dlna.DlnaManager.INSTANCE.writePcmData(buffer, offset, length);
             }
+
+            @Override
+            public void onFlush() {
+                cn.toside.music.mobile.dlna.DlnaManager.INSTANCE.clearPcmBuffer();
+            }
         }
     );
 

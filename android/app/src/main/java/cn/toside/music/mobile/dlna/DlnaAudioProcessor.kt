@@ -24,13 +24,6 @@ class DlnaAudioProcessor : BaseAudioProcessor() {
     private val targetChannels = 2
     private val targetBytesPerSample = 2 // 16-bit = 2 bytes
 
-    // 线性重采样与声道适配缓冲区
-    private var resampleRatio = 1.0
-    private var resampleFraction = 0.0
-    private var lastLeftSample = 0
-    private var lastRightSample = 0
-    private var queueCount = 0L
-
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
         Log.i(tag, "Configuring AudioProcessor with input: " +
                 "sampleRate=${inputAudioFormat.sampleRate}, " +
@@ -42,11 +35,6 @@ class DlnaAudioProcessor : BaseAudioProcessor() {
             return AudioProcessor.AudioFormat.NOT_SET
         }
 
-        resampleRatio = inputAudioFormat.sampleRate.toDouble() / targetSampleRate.toDouble()
-        resampleFraction = 0.0
-        lastLeftSample = 0
-        lastRightSample = 0
-
         // 保持输出与输入格式一致以保证向下游 AudioTrack 传递，拦截过程在内部处理
         return inputAudioFormat
     }
@@ -54,11 +42,6 @@ class DlnaAudioProcessor : BaseAudioProcessor() {
     override fun queueInput(inputBuffer: ByteBuffer) {
         val remaining = inputBuffer.remaining()
         if (remaining == 0) return
-
-        queueCount++
-        if (queueCount % 100L == 1L) {
-            Log.i(tag, "queueInput #$queueCount: $remaining bytes received, isStreaming=${DlnaManager.isStreaming()}")
-        }
 
         // 仅在 DLNA 处于推流状态时捕获并分发音频数据
         if (DlnaManager.isStreaming()) {
@@ -74,7 +57,7 @@ class DlnaAudioProcessor : BaseAudioProcessor() {
                 duplicate.get(pcmBytes)
                 DlnaManager.writePcmData(pcmBytes, 0, pcmBytes.size)
             } else {
-                // 采样率、声道数或编码不一致时，实时转换归一化至 48kHz 16-bit 双声道
+                // 委托规范声道适配与位深归一化至 48kHz 16-bit 双声道
                 val convertedBytes = convertToTargetPcm(duplicate, inputFormat)
                 if (convertedBytes.isNotEmpty()) {
                     DlnaManager.writePcmData(convertedBytes, 0, convertedBytes.size)
@@ -89,32 +72,29 @@ class DlnaAudioProcessor : BaseAudioProcessor() {
     }
 
     /**
-     * 将任意 16-bit / Float PCM 输入流转换为标准 48000Hz 立体声 16-bit PCM
+     * 将 16-bit / Float PCM 输入流转换为标准 48000Hz 立体声 16-bit PCM (采样率由 SonicAudioProcessor 统一处理)
      */
     private fun convertToTargetPcm(buffer: ByteBuffer, format: AudioProcessor.AudioFormat): ByteArray {
         val inChannels = format.channelCount
-        val inSampleRate = format.sampleRate
         val isFloat = format.encoding == C.ENCODING_PCM_FLOAT
         val bytesPerSample = if (isFloat) 4 else 2
         val totalInFrames = buffer.remaining() / (inChannels * bytesPerSample)
         if (totalInFrames <= 0) return ByteArray(0)
 
-        // 估算输出帧数
-        val estimatedOutFrames = ((totalInFrames / resampleRatio) + 2).toInt()
-        val outBytes = ByteArray(estimatedOutFrames * targetChannels * targetBytesPerSample)
+        val outBytes = ByteArray(totalInFrames * targetChannels * targetBytesPerSample)
         val outBuf = ByteBuffer.wrap(outBytes).order(ByteOrder.LITTLE_ENDIAN)
 
         while (buffer.remaining() >= inChannels * bytesPerSample) {
-            val left = if (isFloat) {
-                (buffer.float.coerceIn(-1.0f, 1.0f) * 32767.0f).toInt()
+            val left: Short = if (isFloat) {
+                (buffer.float.coerceIn(-1.0f, 1.0f) * 32767.0f).toInt().toShort()
             } else {
-                buffer.short.toInt()
+                buffer.short
             }
-            val right = if (inChannels >= 2) {
+            val right: Short = if (inChannels >= 2) {
                 if (isFloat) {
-                    (buffer.float.coerceIn(-1.0f, 1.0f) * 32767.0f).toInt()
+                    (buffer.float.coerceIn(-1.0f, 1.0f) * 32767.0f).toInt().toShort()
                 } else {
-                    buffer.short.toInt()
+                    buffer.short
                 }
             } else left
 
@@ -127,42 +107,20 @@ class DlnaAudioProcessor : BaseAudioProcessor() {
                 }
             }
 
-            if (inSampleRate == targetSampleRate) {
-                if (outBuf.remaining() >= 4) {
-                    outBuf.putShort(left.toShort())
-                    outBuf.putShort(right.toShort())
-                }
-            } else {
-                // 线性插值重采样
-                while (resampleFraction < 1.0 && outBuf.remaining() >= 4) {
-                    val interpLeft = (lastLeftSample + (left - lastLeftSample) * resampleFraction).toInt().coerceIn(-32768, 32767)
-                    val interpRight = (lastRightSample + (right - lastRightSample) * resampleFraction).toInt().coerceIn(-32768, 32767)
-                    outBuf.putShort(interpLeft.toShort())
-                    outBuf.putShort(interpRight.toShort())
-                    resampleFraction += resampleRatio
-                }
-                resampleFraction -= 1.0
-            }
-
-            lastLeftSample = left
-            lastRightSample = right
+            outBuf.putShort(left)
+            outBuf.putShort(right)
         }
 
-        val outSize = outBuf.position()
-        return if (outSize == outBytes.size) {
-            outBytes
-        } else {
-            outBytes.copyOf(outSize)
-        }
+        return outBytes
     }
 
     override fun onFlush() {
-        resampleFraction = 0.0
-        lastLeftSample = 0
-        lastRightSample = 0
+        super.onFlush()
+        DlnaManager.clearPcmBuffer()
     }
 
     override fun onReset() {
+        super.onReset()
         onFlush()
     }
 

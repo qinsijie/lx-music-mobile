@@ -25,6 +25,7 @@ public class DlnaAudioProcessor extends BaseAudioProcessor {
 
     public interface AudioDataListener {
         void onAudioData(byte[] buffer, int offset, int length);
+        void onFlush();
     }
 
     private static volatile AudioDataListener dataListener = null;
@@ -44,11 +45,6 @@ public class DlnaAudioProcessor extends BaseAudioProcessor {
         return INSTANCE;
     }
 
-    private double resampleRatio = 1.0;
-    private double resampleFraction = 0.0;
-    private int lastLeftSample = 0;
-    private int lastRightSample = 0;
-
     public DlnaAudioProcessor() {
         Log.i(TAG, "DlnaAudioProcessor instance constructed!");
     }
@@ -65,12 +61,16 @@ public class DlnaAudioProcessor extends BaseAudioProcessor {
             return AudioProcessor.AudioFormat.NOT_SET;
         }
 
-        resampleRatio = (double) inputAudioFormat.sampleRate / (double) TARGET_SAMPLE_RATE;
-        resampleFraction = 0.0;
-        lastLeftSample = 0;
-        lastRightSample = 0;
-
         return inputAudioFormat;
+    }
+
+    @Override
+    protected void onFlush() {
+        super.onFlush();
+        AudioDataListener listener = dataListener;
+        if (listener != null) {
+            listener.onFlush();
+        }
     }
 
     @Override
@@ -88,10 +88,12 @@ public class DlnaAudioProcessor extends BaseAudioProcessor {
             if (format.encoding == C.ENCODING_PCM_16BIT &&
                 format.sampleRate == TARGET_SAMPLE_RATE &&
                 format.channelCount == TARGET_CHANNELS) {
+                // 完美匹配 48kHz 16-bit 立体声，直接批量提取投递
                 byte[] pcmBytes = new byte[duplicate.remaining()];
                 duplicate.get(pcmBytes);
                 listener.onAudioData(pcmBytes, 0, pcmBytes.length);
             } else {
+                // 委托规范声道适配与位深归一化至 48kHz 16-bit 双声道 (采样率已由前置 SonicAudioProcessor 保证)
                 byte[] converted = convertToTargetPcm(duplicate, format);
                 if (converted.length > 0) {
                     listener.onAudioData(converted, 0, converted.length);
@@ -106,30 +108,28 @@ public class DlnaAudioProcessor extends BaseAudioProcessor {
 
     private byte[] convertToTargetPcm(ByteBuffer buffer, AudioFormat format) {
         int inChannels = format.channelCount;
-        int inSampleRate = format.sampleRate;
         boolean isFloat = format.encoding == C.ENCODING_PCM_FLOAT;
         int bytesPerSample = isFloat ? 4 : 2;
         int totalInFrames = buffer.remaining() / (inChannels * bytesPerSample);
         if (totalInFrames <= 0) return new byte[0];
 
-        int estimatedOutFrames = (int) ((totalInFrames / resampleRatio) + 2);
-        byte[] outBytes = new byte[estimatedOutFrames * TARGET_CHANNELS * TARGET_BYTES_PER_SAMPLE];
+        byte[] outBytes = new byte[totalInFrames * TARGET_CHANNELS * TARGET_BYTES_PER_SAMPLE];
         ByteBuffer outBuf = ByteBuffer.wrap(outBytes).order(ByteOrder.LITTLE_ENDIAN);
 
         while (buffer.remaining() >= inChannels * bytesPerSample) {
-            int left;
+            short left;
             if (isFloat) {
                 float f = Math.max(-1.0f, Math.min(1.0f, buffer.getFloat()));
-                left = (int) (f * 32767.0f);
+                left = (short) (f * 32767.0f);
             } else {
                 left = buffer.getShort();
             }
 
-            int right;
+            short right;
             if (inChannels >= 2) {
                 if (isFloat) {
                     float f = Math.max(-1.0f, Math.min(1.0f, buffer.getFloat()));
-                    right = (int) (f * 32767.0f);
+                    right = (short) (f * 32767.0f);
                 } else {
                     right = buffer.getShort();
                 }
@@ -145,86 +145,51 @@ public class DlnaAudioProcessor extends BaseAudioProcessor {
                 }
             }
 
-            if (inSampleRate == TARGET_SAMPLE_RATE) {
-                if (outBuf.remaining() >= 4) {
-                    outBuf.putShort((short) left);
-                    outBuf.putShort((short) right);
-                }
-            } else {
-                while (resampleFraction < 1.0 && outBuf.remaining() >= 4) {
-                    int interpLeft = (int) (lastLeftSample + (left - lastLeftSample) * resampleFraction);
-                    int interpRight = (int) (lastRightSample + (right - lastRightSample) * resampleFraction);
-                    interpLeft = Math.max(-32768, Math.min(32767, interpLeft));
-                    interpRight = Math.max(-32768, Math.min(32767, interpRight));
-                    outBuf.putShort((short) interpLeft);
-                    outBuf.putShort((short) interpRight);
-                    resampleFraction += resampleRatio;
-                }
-                resampleFraction -= 1.0;
-            }
-
-            lastLeftSample = left;
-            lastRightSample = right;
+            outBuf.putShort(left);
+            outBuf.putShort(right);
         }
 
-        int outSize = outBuf.position();
-        if (outSize == outBytes.length) {
-            return outBytes;
-        } else {
-            byte[] trimmed = new byte[outSize];
-            System.arraycopy(outBytes, 0, trimmed, 0, outSize);
-            return trimmed;
-        }
+        return outBytes;
     }
 
     @Override
-    public void onFlush() {
-        resampleFraction = 0.0;
-        lastLeftSample = 0;
-        lastRightSample = 0;
-    }
-
-    @Override
-    public void onReset() {
-        onFlush();
+    public boolean isActive() {
+        return inputAudioFormat != AudioFormat.NOT_SET;
     }
 }
 `
 
-const musicManagerPath = path.join(rootPath, 'node_modules/react-native-track-player/android/src/main/java/com/guichaguri/trackplayer/service/MusicManager.java')
-const dlnaProcessorPath = path.join(rootPath, 'node_modules/react-native-track-player/android/src/main/java/com/guichaguri/trackplayer/service/DlnaAudioProcessor.java')
-
-;(async() => {
-  console.log('=== Starting DLNA Dependencies Patching ===')
-
+const patchTrackPlayer = async() => {
   // 1. Write DlnaAudioProcessor.java directly into react-native-track-player
-  const serviceDir = path.dirname(dlnaProcessorPath)
-  if (fs.existsSync(serviceDir)) {
+  const dlnaProcessorPath = path.join(rootPath, 'node_modules/react-native-track-player/android/src/main/java/com/guichaguri/trackplayer/service/DlnaAudioProcessor.java')
+  const dir = path.dirname(dlnaProcessorPath)
+  if (fs.existsSync(dir)) {
     console.log(`Writing DlnaAudioProcessor.java to ${dlnaProcessorPath}`)
     await fs.promises.writeFile(dlnaProcessorPath, dlnaAudioProcessorCode, 'utf8')
     console.log('DlnaAudioProcessor.java successfully written.')
   } else {
-    console.warn(`Directory ${serviceDir} does not exist yet.`)
+    console.warn(`Directory ${dir} not found. Skipping DlnaAudioProcessor.java write.`)
   }
 
-  // 2. Patch MusicManager.java
+  // 2. Patch MusicManager.java in react-native-track-player to install DlnaAudioProcessor and force software offload=false
+  const musicManagerPath = path.join(rootPath, 'node_modules/react-native-track-player/android/src/main/java/com/guichaguri/trackplayer/service/MusicManager.java')
   if (fs.existsSync(musicManagerPath)) {
-    console.log(`Patching ${musicManagerPath}`)
+    console.log(`Patching ${musicManagerPath}...`)
     let content = (await fs.promises.readFile(musicManagerPath, 'utf8')).toString()
 
-    // Disable audio offload
-    const offloadPattern = 'boolean shouldEnableAudioOffload = options.getBoolean("audioOffload", true);'
-    const offloadReplacement = 'boolean shouldEnableAudioOffload = false; // DLNA: disable hardware offload so AudioProcessors receive PCM'
-    if (content.includes(offloadPattern)) {
-      content = content.replace(offloadPattern, offloadReplacement)
+    // Disable audioOffload
+    const offloadPattern = 'boolean shouldEnableAudioOffload = false;'
+    const offloadSearch = /boolean shouldEnableAudioOffload\s*=\s*[^;]+;/
+    if (offloadSearch.test(content) && !content.includes(offloadPattern)) {
+      content = content.replace(offloadSearch, offloadPattern)
       console.log('Patched audioOffload to false.')
-    } else if (content.includes(offloadReplacement)) {
+    } else if (content.includes(offloadPattern)) {
       console.log('audioOffload already patched.')
     } else {
       console.warn('Could not find audioOffload pattern in MusicManager.java!')
     }
 
-    // Replace DefaultRenderersFactory instantiation with custom AudioSink builder
+    // Replace DefaultRenderersFactory instantiation with custom AudioSink builder (inserting SonicAudioProcessor for high-quality 48kHz resampling)
     const rfPattern = 'DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory(service);'
     const rfReplacement = `DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory(service) {
             @Override
@@ -233,19 +198,29 @@ const dlnaProcessorPath = path.join(rootPath, 'node_modules/react-native-track-p
                     boolean enableFloatOutput,
                     boolean enableAudioTrackPlaybackParams) {
                 android.util.Log.i("DlnaAudioProcessor", "buildAudioSink invoked in MusicManager!");
+                androidx.media3.common.audio.SonicAudioProcessor sonic = new androidx.media3.common.audio.SonicAudioProcessor();
+                sonic.setOutputSampleRateHz(48000);
                 return new androidx.media3.exoplayer.audio.DefaultAudioSink.Builder(context)
                         .setEnableFloatOutput(false)
                         .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
-                        .setAudioProcessors(new androidx.media3.common.audio.AudioProcessor[]{ DlnaAudioProcessor.getInstance() })
+                        .setAudioProcessors(new androidx.media3.common.audio.AudioProcessor[]{ sonic, DlnaAudioProcessor.getInstance() })
                         .build();
             }
         };`
 
-    if (content.includes(rfPattern)) {
+    if (content.includes('buildAudioSink invoked in MusicManager!')) {
+      if (!content.includes('SonicAudioProcessor')) {
+        content = content.replace(
+          /DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory\(service\) \{[\s\S]*?build\(\);\s*\}\s*\};/,
+          rfReplacement
+        )
+        console.log('Updated DefaultRenderersFactory with SonicAudioProcessor in MusicManager.java.')
+      } else {
+        console.log('DefaultRenderersFactory already patched with SonicAudioProcessor.')
+      }
+    } else if (content.includes(rfPattern)) {
       content = content.replace(rfPattern, rfReplacement)
       console.log('Patched DefaultRenderersFactory in MusicManager.java.')
-    } else if (content.includes('buildAudioSink invoked in MusicManager!')) {
-      console.log('DefaultRenderersFactory already patched.')
     } else {
       throw new Error('CRITICAL: Could not find DefaultRenderersFactory pattern in MusicManager.java!')
     }
@@ -262,7 +237,7 @@ const dlnaProcessorPath = path.join(rootPath, 'node_modules/react-native-track-p
 
     // Assertion check
     const verified = (await fs.promises.readFile(musicManagerPath, 'utf8')).toString()
-    if (!verified.includes('DlnaAudioProcessor.getInstance()') || !verified.includes('shouldEnableAudioOffload = false')) {
+    if (!verified.includes('DlnaAudioProcessor.getInstance()') || !verified.includes('SonicAudioProcessor') || !verified.includes('shouldEnableAudioOffload = false')) {
       throw new Error('CRITICAL ASSERTION FAILED: MusicManager.java patch verification failed!')
     }
     console.log('MusicManager.java patch verified successfully.')
@@ -283,9 +258,9 @@ const dlnaProcessorPath = path.join(rootPath, 'node_modules/react-native-track-p
       console.error('Failed to build react-native-track-player:', err.message)
     }
   }
+}
 
-  console.log('\n=== Dependencies patch completed successfully! ===\n')
-})().catch(err => {
-  console.error('Dependencies patch failed:', err)
+patchTrackPlayer().catch((err) => {
+  console.error('Error executing patchTrackPlayer:', err)
   process.exit(1)
 })

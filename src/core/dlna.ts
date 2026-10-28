@@ -45,13 +45,31 @@ export const initDlna = () => {
 
   // 监听原生状态流转
   onDlnaStateChanged(({ state: newState, message }) => {
-    // 严格锁定状态机：一旦处于 STREAMING，除非用户显式断开 (STOPPED/IDLE) 或发生致命错误 (ERROR)，
+    // 若被远端抢占断开，静默重置为“未投送”并恢复手机本地发声
+    if (newState === 'IDLE' && message === 'PREEMPTED') {
+      state.state = 'IDLE'
+      state.currentDevice = null
+      void setVolume(state.savedVolume)
+      notifyListeners()
+      return
+    }
+
+    // 主动停止
+    if (newState === 'STOPPED') {
+      state.state = 'IDLE'
+      state.currentDevice = null
+      void setVolume(state.savedVolume)
+      notifyListeners()
+      return
+    }
+
+    // 严格锁定状态机：一旦处于 STREAMING，除非用户显式断开或发生错误，
     // 严禁因任何后台扫描或切歌刷新而跳回 IDLE
     if (state.state === 'STREAMING' && (newState === 'SCANNING' || newState === 'IDLE')) {
       return
     }
     state.state = newState
-    if (newState === 'IDLE' || newState === 'STOPPED') {
+    if (newState === 'IDLE') {
       state.currentDevice = null
     }
     notifyListeners()
