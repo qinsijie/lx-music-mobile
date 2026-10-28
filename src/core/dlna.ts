@@ -133,7 +133,8 @@ export const connectDlnaDevice = async(device: DlnaDevice): Promise<boolean> => 
     toast(`正在连接到 ${device.name}...`)
     const success = await nativeStartStreaming(device, 8088)
 
-    if (success) {
+    // 严密防竞态：检查在连接握手期间，原生端是否已触发了断开事件将状态重置为 IDLE/STOPPED
+    if (success && state.state === 'CONNECTING') {
       state.currentDevice = device
       state.state = 'STREAMING'
 
@@ -147,7 +148,11 @@ export const connectDlnaDevice = async(device: DlnaDevice): Promise<boolean> => 
       state.currentDevice = null
       await setVolume(state.savedVolume)
       notifyListeners()
-      toast(`连接至 ${device.name} 失败`)
+      if (success) {
+        toast(`连接至 ${device.name} 已中断`)
+      } else {
+        toast(`连接至 ${device.name} 失败`)
+      }
       return false
     }
   } catch (err: any) {

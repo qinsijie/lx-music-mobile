@@ -1,6 +1,7 @@
 package cn.toside.music.mobile.dlna
 
 import android.util.Log
+import java.io.BufferedOutputStream
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStream
@@ -124,9 +125,10 @@ class LocalHttpServer(val port: Int = 8088) {
 
     // 环形缓冲与高精度时钟匀速发包器
     private val ringBuffer = PcmRingBuffer(48000) // 250ms 缓冲池
-    private val CHUNK_MS = 10L // 每 10ms 严格匀速推送一次
-    private val CHUNK_BYTES = 1920 // 48000 * 2 * 2 * 0.01 = 1920 字节
+    private val CHUNK_MS = 20L // 每 20ms 匀速推送一次 (降低上下文切换损耗，对齐标准音频周期)
+    private val CHUNK_BYTES = 3840 // 48000 * 2 * 2 * 0.02 = 3840 字节 (严格 192,000 字节/秒)
     private val TARGET_NANOS_PER_CHUNK = CHUNK_MS * 1_000_000L
+    private val pacerLock = java.lang.Object()
     private var pacerThread: Thread? = null
 
     /**
@@ -171,13 +173,14 @@ class LocalHttpServer(val port: Int = 8088) {
         try {
             // 严格网络底层调优：
             socket.tcpNoDelay = true // 禁用 Nagle 算法，杜绝攒包延迟
-            socket.sendBufferSize = 32768 // 32KB SO_SNDBUF
+            socket.sendBufferSize = 65536 // 64KB SO_SNDBUF，给予网络发送队列足够弹性
             try {
                 socket.trafficClass = 0x10 // IPTOS_LOWDELAY，低延迟服务类型
             } catch (_: Exception) {}
 
             val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-            val out = socket.getOutputStream()
+            val rawOut = socket.getOutputStream()
+            val out = BufferedOutputStream(rawOut, 16384)
 
             val requestLine = reader.readLine() ?: run {
                 socket.close()
@@ -199,6 +202,7 @@ class LocalHttpServer(val port: Int = 8088) {
             val parts = requestLine.split(" ")
             if (parts.size < 2) {
                 sendNotFound(out)
+                out.flush()
                 socket.close()
                 return
             }
@@ -217,7 +221,7 @@ class LocalHttpServer(val port: Int = 8088) {
                 if (method == "GET") {
                     val isChunked = path.contains("chunked=1")
                     val wavHeader = createWavHeader(48000, 2, 16)
-                    val silencePreBuffer = ByteArray(38400) // 200ms 48000Hz 16-bit 双声道 PCM 静音数据首包预填充
+                    val silencePreBuffer = ByteArray(76800) // 400ms 48000Hz 16-bit 双声道 PCM 静音数据首包预填充 (76,800 字节)
                     val subscriber = ClientSubscriber(socket, out, isChunked)
 
                     // 先清理已有旧连接
@@ -227,7 +231,7 @@ class LocalHttpServer(val port: Int = 8088) {
                     subscribers.clear()
                     ringBuffer.clear()
 
-                    // 先写响应头、44 字节实时 WAV 头与 200ms 首包预填充
+                    // 先写响应头、44 字节实时 WAV 头与 400ms 首包预填充并立即 flush
                     if (isChunked) {
                         sendChunkedHeaders(out)
                         sendChunk(out, wavHeader, 0, wavHeader.size)
@@ -240,7 +244,10 @@ class LocalHttpServer(val port: Int = 8088) {
                     out.flush()
 
                     subscribers.add(subscriber)
-                    Log.i(tag, "Client subscribed to audio stream: ${socket.remoteSocketAddress}. 44-byte WAV header and 200ms silence pre-buffer sent and flushed. Pipeline is ACTIVE.")
+                    synchronized(pacerLock) {
+                        pacerLock.notifyAll()
+                    }
+                    Log.i(tag, "Client subscribed to audio stream: ${socket.remoteSocketAddress}. 44-byte WAV header and 400ms silence pre-buffer sent and flushed. Pipeline is ACTIVE.")
                     return
                 }
             }
@@ -258,34 +265,43 @@ class LocalHttpServer(val port: Int = 8088) {
 
     /**
      * 高精度单调时钟匀速发包器 (Streaming Pacer)
-     * 基于 System.nanoTime() 锚定时间轴，以严格的 48kHz 16-bit 双声道节奏 (192,000 字节/秒，每 10ms 一包 1920 字节)
+     * 基于 System.nanoTime() 锚定时间轴，以严格的 48kHz 16-bit 双声道节奏 (192,000 字节/秒，每 20ms 一包 3840 字节)
      * 匀速推流，平滑所有解码突发 (Burst)。
      * 出队融合：有真实数据送出真实数据；无真实数据动态送出静音；新曲目到达时零残留立即接续。
      */
     private fun runStreamingPacer() {
-        Log.i(tag, "Streaming Pacer thread started (10ms / 1920 bytes pacing, strictly 192,000 B/s)")
+        Log.i(tag, "Streaming Pacer thread started (${CHUNK_MS}ms / $CHUNK_BYTES bytes pacing, strictly 192,000 B/s)")
         val sendBuffer = ByteArray(CHUNK_BYTES)
         var nextSendTimeNanos = System.nanoTime()
 
         while (isRunning.get()) {
             try {
                 if (subscribers.isEmpty()) {
-                    Thread.sleep(20)
+                    synchronized(pacerLock) {
+                        while (subscribers.isEmpty() && isRunning.get()) {
+                            try {
+                                pacerLock.wait(50)
+                            } catch (_: InterruptedException) {
+                                return
+                            }
+                        }
+                    }
                     nextSendTimeNanos = System.nanoTime()
-                    continue
+                    if (!isRunning.get()) break
                 }
 
                 // 1. 高精度时钟对齐
                 val now = System.nanoTime()
                 val waitNanos = nextSendTimeNanos - now
-                if (waitNanos > 1_500_000L) { // 剩余时间 > 1.5ms，进入睡眠
-                    Thread.sleep(waitNanos / 1_000_000L)
+                if (waitNanos > 2_000_000L) { // 剩余时间 > 2ms，进入休眠
+                    val sleepMs = waitNanos / 1_000_000L
+                    Thread.sleep(sleepMs)
                 } else if (waitNanos > 0) {
                     Thread.yield()
                 }
 
                 val curTime = System.nanoTime()
-                // 若由于系统线程调度或休眠导致落后超过 50ms，重置时钟锚点，杜绝突发追赶倾泻 (Burst Catch-up)
+                // 若由于系统休眠或调度落后超过 50ms，重置时钟锚点，杜绝突发追赶倾泻 (Burst Catch-up)
                 if (curTime - nextSendTimeNanos > 50_000_000L) {
                     nextSendTimeNanos = curTime
                 }
@@ -405,6 +421,9 @@ class LocalHttpServer(val port: Int = 8088) {
         serverSocket = null
 
         pacerThread?.interrupt()
+        synchronized(pacerLock) {
+            pacerLock.notifyAll()
+        }
         pacerThread = null
 
         ringBuffer.clear()

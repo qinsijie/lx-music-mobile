@@ -42,13 +42,28 @@ object HqpeClient {
     }
 
     fun setUriSync(controlUrl: String, streamUrl: String): Result<Unit> {
+        val didlLite = """<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
+  <item id="1" parentID="0" restricted="1">
+    <dc:title>LX Music Live Stream</dc:title>
+    <dc:creator>LX Music</dc:creator>
+    <upnp:class>object.item.audioItem.musicTrack</upnp:class>
+    <res protocolInfo="http-get:*:audio/wav:*" duration="03:00:00.000" sampleFrequency="48000" nrAudioChannels="2" bitsPerSample="16">$streamUrl</res>
+  </item>
+</DIDL-Lite>"""
+
+        val escapedMetaData = didlLite
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;")
+
         val payload = """<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
   <s:Body>
     <u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
       <InstanceID>0</InstanceID>
       <CurrentURI>$streamUrl</CurrentURI>
-      <CurrentURIMetaData></CurrentURIMetaData>
+      <CurrentURIMetaData>$escapedMetaData</CurrentURIMetaData>
     </u:SetAVTransportURI>
   </s:Body>
 </s:Envelope>""".trimIndent()
