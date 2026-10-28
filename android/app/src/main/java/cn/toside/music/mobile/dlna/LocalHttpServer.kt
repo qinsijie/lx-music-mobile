@@ -7,7 +7,6 @@ import java.io.OutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
-import java.net.SocketException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.CopyOnWriteArrayList
@@ -131,7 +130,7 @@ class LocalHttpServer(val port: Int = 8088) {
     private var pacerThread: Thread? = null
 
     /**
-     * 客户端异常断开或被远端 Reset 回调（被另一台手机接管或渲染器主动中断）
+     * 客户端断开连接或 Broken pipe 回调通知
      */
     var onClientDisconnected: ((reason: String) -> Unit)? = null
 
@@ -169,11 +168,10 @@ class LocalHttpServer(val port: Int = 8088) {
     }
 
     private fun handleClient(socket: Socket) {
-        var registeredSubscriber: ClientSubscriber? = null
         try {
             // 严格网络底层调优：
             socket.tcpNoDelay = true // 禁用 Nagle 算法，杜绝攒包延迟
-            socket.sendBufferSize = 16384 // 缩减 SO_SNDBUF 至 16KB，配合 10ms 小包推送，杜绝系统内核缓冲区积压
+            socket.sendBufferSize = 32768 // 32KB SO_SNDBUF
             try {
                 socket.trafficClass = 0x10 // IPTOS_LOWDELAY，低延迟服务类型
             } catch (_: Exception) {}
@@ -222,7 +220,7 @@ class LocalHttpServer(val port: Int = 8088) {
                     val silencePreBuffer = ByteArray(38400) // 200ms 48000Hz 16-bit 双声道 PCM 静音数据首包预填充
                     val subscriber = ClientSubscriber(socket, out, isChunked)
 
-                    // 如果有已有旧连接，先主动释放旧连接，防止多设备/重复拉流冲突
+                    // 先清理已有旧连接
                     for (oldSub in subscribers) {
                         try { oldSub.socket.close() } catch (_: Exception) {}
                     }
@@ -242,23 +240,7 @@ class LocalHttpServer(val port: Int = 8088) {
                     out.flush()
 
                     subscribers.add(subscriber)
-                    registeredSubscriber = subscriber
-                    Log.i(tag, "Client subscribed to audio stream: ${socket.remoteSocketAddress}. 44-byte WAV header and 200ms silence pre-buffer sent and flushed.")
-
-                    // 持续监听客户端 Socket 连接状态 (阻塞等待客户端关闭或对端 Reset)
-                    val input = socket.getInputStream()
-                    val dummy = ByteArray(128)
-                    while (isRunning.get() && !socket.isClosed) {
-                        val read = input.read(dummy)
-                        if (read == -1) {
-                            break
-                        }
-                    }
-
-                    Log.i(tag, "Client socket read reached EOF: ${socket.remoteSocketAddress}")
-                    subscribers.remove(subscriber)
-                    try { socket.close() } catch (_: Exception) {}
-                    notifyClientDisconnected("Client closed connection (EOF)")
+                    Log.i(tag, "Client subscribed to audio stream: ${socket.remoteSocketAddress}. 44-byte WAV header and 200ms silence pre-buffer sent and flushed. Pipeline is ACTIVE.")
                     return
                 }
             }
@@ -269,12 +251,8 @@ class LocalHttpServer(val port: Int = 8088) {
             socket.close()
 
         } catch (e: Exception) {
-            Log.d(tag, "Client handling exception (${e.javaClass.simpleName}): ${e.message}")
-            registeredSubscriber?.let { subscribers.remove(it) }
+            Log.w(tag, "Client handshake exception (${e.javaClass.simpleName}): ${e.message}")
             try { socket.close() } catch (_: Exception) {}
-            if (e is SocketException || e.message?.contains("reset", ignoreCase = true) == true) {
-                notifyClientDisconnected("SocketException: ${e.message}")
-            }
         }
     }
 
@@ -348,7 +326,7 @@ class LocalHttpServer(val port: Int = 8088) {
 
     private fun notifyClientDisconnected(reason: String) {
         if (isRunning.get()) {
-            Log.i(tag, "Client disconnection notified: $reason")
+            Log.w(tag, "Active client disconnection notified: $reason")
             onClientDisconnected?.invoke(reason)
         }
     }

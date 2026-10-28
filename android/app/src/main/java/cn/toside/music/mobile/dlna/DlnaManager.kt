@@ -5,6 +5,7 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicReference
 
@@ -83,13 +84,14 @@ object DlnaManager {
 
     /**
      * 连接至指定的 DLNA 渲染设备并启动串流
+     * 包含投送发起前的“强行复位与解卡死机制”（彻底根除 701）
      */
     fun startStreaming(context: Context, device: DlnaDevice, port: Int = DEFAULT_PORT, callback: ((Boolean, String?) -> Unit)? = null) {
-        // 1. 防重复投送：若已经在向同一设备推流中，直接复用连接
+        // 1. 防重复投送：若已经在向同一设备推流中且底层活跃，直接复用连接
         val isAlreadyStreaming = currentState.get() == DlnaState.STREAMING
         val isSameDevice = currentDevice?.id == device.id ||
                 (currentDevice?.ip == device.ip && currentDevice?.controlUrl == device.controlUrl)
-        val isServerActive = localHttpServer?.isRunning() == true
+        val isServerActive = localHttpServer?.isRunning() == true && (localHttpServer?.getClientCount() ?: 0) > 0
 
         if (isAlreadyStreaming && isSameDevice && isServerActive) {
             Log.i(TAG, "Already actively streaming to device ${device.friendlyName} (${device.ip}). Guarding against duplicate startStreaming.")
@@ -97,48 +99,45 @@ object DlnaManager {
             return
         }
 
-        // 2. 双设备切换规范：若切换到不同设备，必须先向旧设备发送 SOAP Stop，并重置本地连接
-        val oldDevice = currentDevice
-        if (oldDevice != null && !isSameDevice) {
-            Log.i(TAG, "Switching target from ${oldDevice.friendlyName} to ${device.friendlyName}. Sending Stop to previous device first...")
-            scope.launch {
-                try {
-                    HqpeClient.stop(oldDevice.controlUrl)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to stop previous device: ${e.message}")
-                }
-            }
-            localHttpServer?.stop()
-            localHttpServer = null
-        }
-
+        // 2. 标记状态为 CONNECTING
         updateState(DlnaState.CONNECTING)
         currentDevice = device
 
         scope.launch {
             try {
-                // 3. 启动本地 HTTP 服务及 Pacer 线程
-                if (localHttpServer == null || !localHttpServer!!.isRunning()) {
-                    val server = LocalHttpServer(port)
-                    // 注册远端 Reset / 接管监听
-                    server.onClientDisconnected = { reason ->
-                        Log.i(TAG, "LocalHttpServer subscriber disconnected ($reason)")
-                        if (currentState.get() == DlnaState.STREAMING) {
-                            Log.w(TAG, "Remote renderer disconnected (preempted by another controller). Gracefully reverting to IDLE.")
-                            stopStreamingSilently()
-                        }
-                    }
-                    if (!server.start()) {
-                        throw IllegalStateException("Failed to bind LocalHttpServer on port $port")
-                    }
-                    localHttpServer = server
+                // 3. 投送发起前的“强行复位与解卡死机制”：
+                // 无论 HQPE 当前是否处于卡死态或中间态，先发送一次 SOAP Stop 强制复位，忽略可能的 701 报错
+                Log.i(TAG, "Pre-resetting target device ${device.friendlyName} via SOAP Stop before SetAVTransportURI...")
+                val preStopResult = HqpeClient.stop(device.controlUrl)
+                if (preStopResult.isFailure) {
+                    Log.w(TAG, "Pre-reset SOAP Stop warning (safely ignored): ${preStopResult.exceptionOrNull()?.message}")
+                } else {
+                    Log.i(TAG, "Pre-reset SOAP Stop accepted by ${device.friendlyName}.")
                 }
 
-                // 清空旧缓冲残留
-                localHttpServer?.clearBuffer()
+                // 延时 150ms 确保 HQPE 彻底平稳复位至 STOPPED 态，杜绝 Transition not available
+                delay(150)
 
-                // 4. 提前激活 STREAMING 状态，解除缓冲饥饿死锁，让当前 ExoPlayer 的 PCM 音频无延迟进入 Pacer 环形缓冲区
-                updateState(DlnaState.STREAMING)
+                // 4. 重建或启动本地 HTTP 推流服务
+                localHttpServer?.stop()
+                localHttpServer = null
+
+                val server = LocalHttpServer(port)
+                server.onClientDisconnected = { reason ->
+                    Log.w(TAG, "LocalHttpServer client disconnected ($reason). Resetting state to IDLE immediately.")
+                    scope.launch {
+                        localHttpServer?.stop()
+                        localHttpServer = null
+                        currentDevice = null
+                        updateState(DlnaState.IDLE, "DISCONNECTED")
+                    }
+                }
+
+                if (!server.start()) {
+                    throw IllegalStateException("Failed to bind LocalHttpServer on port $port")
+                }
+                localHttpServer = server
+                localHttpServer?.clearBuffer()
 
                 // 5. 解析面向目标设备 IP 的精准本机 IP (规避 VPN/虚拟网卡)
                 val localIp = NetworkUtils.getLocalIpAddress(context, device.ip, device.port)
@@ -149,26 +148,18 @@ object DlnaManager {
                 val setUriResult = HqpeClient.setUri(device.controlUrl, streamUrl)
                 if (setUriResult.isFailure) {
                     val err = setUriResult.exceptionOrNull()?.message ?: "未知错误"
-                    // 若返回 701 (Transition not available)，表明 HQPE 当前已在播放该流，允许通过
-                    if (err.contains("701") && (localHttpServer?.getClientCount() ?: 0) > 0) {
-                        Log.w(TAG, "SetAVTransportURI returned 701 but client is already connected, treating as success.")
-                    } else {
-                        throw IllegalStateException("[SetAVTransportURI 阶段] $err")
-                    }
+                    throw IllegalStateException("[SetAVTransportURI 阶段] $err")
                 }
 
                 // 7. 执行 SOAP Play
                 val playResult = HqpeClient.play(device.controlUrl)
                 if (playResult.isFailure) {
                     val err = playResult.exceptionOrNull()?.message ?: "未知错误"
-                    // 若返回 701 (Transition not available)，表明 HQPE 当前已在 PLAYING 状态，允许通过
-                    if (err.contains("701") && (localHttpServer?.getClientCount() ?: 0) > 0) {
-                        Log.w(TAG, "Play returned 701 but client is already playing, treating as success.")
-                    } else {
-                        throw IllegalStateException("[Play 阶段] $err")
-                    }
+                    throw IllegalStateException("[Play 阶段] $err")
                 }
 
+                // 8. 成功下发 Play 并进入播放管道后，激活 STREAMING 状态
+                updateState(DlnaState.STREAMING)
                 Log.i(TAG, "Successfully started streaming to ${device.friendlyName} via $streamUrl")
                 callback?.invoke(true, null)
 
@@ -177,7 +168,7 @@ object DlnaManager {
                 currentDevice = null
                 localHttpServer?.stop()
                 localHttpServer = null
-                updateState(DlnaState.ERROR, e.message)
+                updateState(DlnaState.IDLE, "ERROR: ${e.message}")
                 eventListener?.onError(e.message ?: "Streaming initiation error")
                 callback?.invoke(false, e.message)
             }
@@ -218,23 +209,6 @@ object DlnaManager {
                 currentDevice = null
                 updateState(DlnaState.IDLE)
                 callback?.invoke(false, e.message)
-            }
-        }
-    }
-
-    /**
-     * 被远端抢占或断开时的静默降级停止（不向远端重复发 Stop，防止干扰接管设备）
-     */
-    private fun stopStreamingSilently() {
-        scope.launch {
-            try {
-                localHttpServer?.stop()
-                localHttpServer = null
-                currentDevice = null
-                updateState(DlnaState.IDLE, "PREEMPTED")
-            } catch (e: Exception) {
-                Log.e(TAG, "stopStreamingSilently error: ${e.message}", e)
-                updateState(DlnaState.IDLE, "PREEMPTED")
             }
         }
     }

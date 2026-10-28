@@ -45,33 +45,27 @@ export const initDlna = () => {
 
   // 监听原生状态流转
   onDlnaStateChanged(({ state: newState, message }) => {
-    // 若被远端抢占断开，静默重置为“未投送”并恢复手机本地发声
-    if (newState === 'IDLE' && message === 'PREEMPTED') {
+    // 只要原生端转为 IDLE 或 STOPPED，无论出于何种原因（断开、被抢占或用户主动停止），
+    // 必须无条件同步更新为 IDLE，恢复本地音量，重置 currentDevice
+    if (newState === 'IDLE' || newState === 'STOPPED') {
       state.state = 'IDLE'
       state.currentDevice = null
       void setVolume(state.savedVolume)
+      if (message === 'DISCONNECTED') {
+        toast('投送连接已中断，手机声音已恢复')
+      } else if (message === 'PREEMPTED') {
+        toast('投送已被其他设备接管，手机声音已恢复')
+      }
       notifyListeners()
       return
     }
 
-    // 主动停止
-    if (newState === 'STOPPED') {
-      state.state = 'IDLE'
-      state.currentDevice = null
-      void setVolume(state.savedVolume)
-      notifyListeners()
+    // 处于 STREAMING 时，仅忽略后台的 SCANNING 状态，不可被扫描临时冲掉
+    if (state.state === 'STREAMING' && newState === 'SCANNING') {
       return
     }
 
-    // 严格锁定状态机：一旦处于 STREAMING，除非用户显式断开或发生错误，
-    // 严禁因任何后台扫描或切歌刷新而跳回 IDLE
-    if (state.state === 'STREAMING' && (newState === 'SCANNING' || newState === 'IDLE')) {
-      return
-    }
     state.state = newState
-    if (newState === 'IDLE') {
-      state.currentDevice = null
-    }
     notifyListeners()
   })
 
@@ -133,6 +127,8 @@ export const connectDlnaDevice = async(device: DlnaDevice): Promise<boolean> => 
   try {
     // 1. 记录当前应用音量 (不影响系统全局媒体音量)
     state.savedVolume = settingState.setting['player.volume'] ?? 1
+    state.state = 'CONNECTING'
+    notifyListeners()
 
     toast(`正在连接到 ${device.name}...`)
     const success = await nativeStartStreaming(device, 8088)
@@ -147,10 +143,18 @@ export const connectDlnaDevice = async(device: DlnaDevice): Promise<boolean> => 
       notifyListeners()
       return true
     } else {
+      state.state = 'IDLE'
+      state.currentDevice = null
+      await setVolume(state.savedVolume)
+      notifyListeners()
       toast(`连接至 ${device.name} 失败`)
       return false
     }
   } catch (err: any) {
+    state.state = 'IDLE'
+    state.currentDevice = null
+    await setVolume(state.savedVolume)
+    notifyListeners()
     toast(`投送失败: ${err?.message ?? err}`)
     return false
   }
