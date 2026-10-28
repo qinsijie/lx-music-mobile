@@ -431,6 +431,12 @@ class LocalHttpServer(val port: Int = 8088) {
                     diagSilenceBytes = 0L
                     diagRealChunks = 0L
                 }
+            } catch (_: InterruptedException) {
+                break
+            } catch (e: Exception) {
+                if (isRunning.get()) {
+                    Log.e(tag, "Error in streaming pacer loop", e)
+                }
             }
         }
         Log.i(tag, "Streaming Pacer thread stopped")
