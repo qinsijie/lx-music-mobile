@@ -1,6 +1,8 @@
 package cn.toside.music.mobile.dlna
 
 import android.content.Context
+import android.net.wifi.WifiManager
+import android.os.PowerManager
 import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -50,6 +52,63 @@ object DlnaManager {
     private var currentDevice: DlnaDevice? = null
     private val currentState = AtomicReference(DlnaState.IDLE)
     private var eventListener: DlnaEventListener? = null
+
+    // 系统级高性能保活锁 (防止三星等系统后台 Wi-Fi 微休眠与 CPU 降频)
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    @Synchronized
+    private fun acquireLocks(context: Context) {
+        try {
+            if (wifiLock == null) {
+                val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                wifiLock = wifiManager?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "LXMusic:DlnaWifiLock")?.apply {
+                    setReferenceCounted(false)
+                }
+            }
+            if (wifiLock?.isHeld == false) {
+                wifiLock?.acquire()
+                Log.i(TAG, "WifiLock (WIFI_MODE_FULL_HIGH_PERF) acquired for uninterrupted streaming.")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to acquire WifiLock: ${e.message}")
+        }
+
+        try {
+            if (wakeLock == null) {
+                val powerManager = context.applicationContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                wakeLock = powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LXMusic:DlnaWakeLock")?.apply {
+                    setReferenceCounted(false)
+                }
+            }
+            if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire()
+                Log.i(TAG, "WakeLock (PARTIAL_WAKE_LOCK) acquired for uninterrupted CPU pacing.")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to acquire WakeLock: ${e.message}")
+        }
+    }
+
+    @Synchronized
+    private fun releaseLocks() {
+        try {
+            if (wifiLock?.isHeld == true) {
+                wifiLock?.release()
+                Log.i(TAG, "WifiLock safely released.")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error releasing WifiLock: ${e.message}")
+        }
+        try {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+                Log.i(TAG, "WakeLock safely released.")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error releasing WakeLock: ${e.message}")
+        }
+    }
 
     fun setEventListener(listener: DlnaEventListener?) {
         this.eventListener = listener
@@ -172,7 +231,8 @@ object DlnaManager {
                         throw IllegalStateException("[Play 阶段] $err")
                     }
 
-                    // c) 确认收到 Play 成功报文后，第一时间激活 STREAMING 状态并向前端返回成功
+                    // c) 确认收到 Play 成功报文后，第一时间激活高性能锁与 STREAMING 状态并向前端返回成功
+                    acquireLocks(context)
                     updateState(DlnaState.STREAMING)
                     Log.i(TAG, "Successfully started streaming to ${device.friendlyName}")
                     callback?.invoke(true, null)
@@ -257,7 +317,12 @@ object DlnaManager {
     }
 
     private fun updateState(newState: DlnaState, message: String? = null) {
-        currentState.set(newState)
+        val previousState = currentState.getAndSet(newState)
+        Log.i(TAG, "DLNA State transition: $previousState -> $newState (message=$message)")
+        // 只要推流结束、断开或发生异常回退至非活跃态，必须严格释放系统锁以进入低功耗待机
+        if (newState == DlnaState.IDLE || newState == DlnaState.STOPPED || newState == DlnaState.ERROR) {
+            releaseLocks()
+        }
         eventListener?.onStateChanged(newState, message)
     }
 }

@@ -128,8 +128,8 @@ class LocalHttpServer(val port: Int = 8088) {
     private val ringBuffer = PcmRingBuffer(48000) // 250ms 缓冲池
     private val BYTES_PER_SECOND = 192000L // 48000 * 2 * 2 (16-bit stereo)
     private val CHUNK_BYTES = 3840 // 20ms 一包 (960 采样帧)
-    private val LEAD_BUFFER_BYTES = 38400L // 维持 200ms 弹性平滑水位 (192,000 * 0.2s = 38,400 字节)
-    private val MAX_CATCHUP_BYTES = 96000L // 最大允许追赶 500ms，超过则重置时钟，防止系统睡眠唤醒后海啸倾泻
+    private val LEAD_BUFFER_BYTES = 76800L // 维持 400ms 弹性平滑跑道 (192,000 * 0.4s = 76,800 字节，抗 DSD128 重度上采样与空口微休眠)
+    private val MAX_CATCHUP_BYTES = 192000L // 最大允许追赶 1000ms，超过则重置时钟，防止系统睡眠唤醒后海啸倾泻
     private val pacerLock = java.lang.Object()
     private var pacerThread: Thread? = null
 
@@ -226,7 +226,7 @@ class LocalHttpServer(val port: Int = 8088) {
                 if (method == "GET") {
                     val isChunked = path.contains("chunked=1")
                     val wavHeader = createWavHeader(48000, 2, 16)
-                    val silencePreBuffer = ByteArray(38400) // 200ms 48000Hz 16-bit 双声道 PCM 静音首包预填充 (38,400 字节)
+                    val silencePreBuffer = ByteArray(76800) // 400ms 48000Hz 16-bit 双声道 PCM 静音首包预填充 (76,800 字节)
                     val subscriber = ClientSubscriber(socket, out, isChunked)
 
                     // 先标记并清理已有旧连接 (主动关闭不触发 onClientDisconnected 级联销毁)
@@ -237,7 +237,7 @@ class LocalHttpServer(val port: Int = 8088) {
                     subscribers.clear()
                     ringBuffer.clear()
 
-                    // 先写响应头、44 字节实时 WAV 头与 200ms 首包预填充并立即 flush
+                    // 先写响应头、44 字节实时 WAV 头与 400ms 首包预填充并立即 flush
                     if (isChunked) {
                         sendChunkedHeaders(out)
                         sendChunk(out, wavHeader, 0, wavHeader.size)
@@ -251,12 +251,12 @@ class LocalHttpServer(val port: Int = 8088) {
 
                     subscribers.add(subscriber)
                     streamStartTimeNanos = System.nanoTime()
-                    totalBytesSent = 38400L // 初始已有 200ms 写入内核 Socket 形成弹性领先水位
+                    totalBytesSent = 76800L // 初始已有 400ms 写入内核 Socket 形成平滑弹性跑道
 
                     synchronized(pacerLock) {
                         pacerLock.notifyAll()
                     }
-                    Log.i(tag, "Client subscribed to audio stream: ${socket.remoteSocketAddress}. 44-byte WAV header and 200ms silence lead-buffer sent and flushed. Pipeline is ACTIVE.")
+                    Log.i(tag, "Client subscribed to audio stream: ${socket.remoteSocketAddress}. 44-byte WAV header and 400ms silence lead-buffer sent and flushed. Pipeline is ACTIVE.")
                     return
                 }
             }
@@ -275,11 +275,16 @@ class LocalHttpServer(val port: Int = 8088) {
     /**
      * 高精度单调时钟匀速发包器 (Streaming Pacer)
      * 基于 System.nanoTime() 物理时间轴与高精度纳秒级误差累积补偿 (nanoTime drift compensation)
-     * 维持 ~200ms 弹性平滑水位，平滑所有 Android OS 线程调度与定时器抖动，完全杜绝欠载卡顿与积压延迟。
+     * 维持 ~400ms 弹性平滑跑道，平滑所有 Android OS 线程调度与定时器抖动，完全杜绝欠载卡顿与积压延迟。
      * 出队融合：若缓冲水位有真实音频立即送出；若水位不足则补齐全 0 静音，零残留零延迟接力。
      */
     private fun runStreamingPacer() {
-        Log.i(tag, "Streaming Pacer thread started (nanoTime drift-compensated pacing with 200ms lead buffer)")
+        try {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
+        } catch (e: Exception) {
+            Log.w(tag, "Failed to set THREAD_PRIORITY_AUDIO for StreamingPacer: ${e.message}")
+        }
+        Log.i(tag, "Streaming Pacer thread started with THREAD_PRIORITY_AUDIO (nanoTime drift-compensated pacing with 400ms lead buffer)")
         val sendBuffer = ByteArray(CHUNK_BYTES)
 
         while (isRunning.get()) {
