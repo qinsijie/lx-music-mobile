@@ -117,7 +117,8 @@ class LocalHttpServer(val port: Int = 8088) {
     private class ClientSubscriber(
         val socket: Socket,
         val outputStream: OutputStream,
-        val isChunked: Boolean
+        val isChunked: Boolean,
+        @Volatile var isClosedManually: Boolean = false
     )
 
     private val subscribers = CopyOnWriteArrayList<ClientSubscriber>()
@@ -125,11 +126,15 @@ class LocalHttpServer(val port: Int = 8088) {
 
     // 环形缓冲与高精度时钟匀速发包器
     private val ringBuffer = PcmRingBuffer(48000) // 250ms 缓冲池
-    private val CHUNK_MS = 20L // 每 20ms 匀速推送一次 (降低上下文切换损耗，对齐标准音频周期)
-    private val CHUNK_BYTES = 3840 // 48000 * 2 * 2 * 0.02 = 3840 字节 (严格 192,000 字节/秒)
-    private val TARGET_NANOS_PER_CHUNK = CHUNK_MS * 1_000_000L
+    private val BYTES_PER_SECOND = 192000L // 48000 * 2 * 2 (16-bit stereo)
+    private val CHUNK_BYTES = 3840 // 20ms 一包 (960 采样帧)
+    private val LEAD_BUFFER_BYTES = 38400L // 维持 200ms 弹性平滑水位 (192,000 * 0.2s = 38,400 字节)
+    private val MAX_CATCHUP_BYTES = 96000L // 最大允许追赶 500ms，超过则重置时钟，防止系统睡眠唤醒后海啸倾泻
     private val pacerLock = java.lang.Object()
     private var pacerThread: Thread? = null
+
+    @Volatile private var streamStartTimeNanos = 0L
+    @Volatile private var totalBytesSent = 0L
 
     /**
      * 客户端断开连接或 Broken pipe 回调通知
@@ -221,17 +226,18 @@ class LocalHttpServer(val port: Int = 8088) {
                 if (method == "GET") {
                     val isChunked = path.contains("chunked=1")
                     val wavHeader = createWavHeader(48000, 2, 16)
-                    val silencePreBuffer = ByteArray(76800) // 400ms 48000Hz 16-bit 双声道 PCM 静音数据首包预填充 (76,800 字节)
+                    val silencePreBuffer = ByteArray(38400) // 200ms 48000Hz 16-bit 双声道 PCM 静音首包预填充 (38,400 字节)
                     val subscriber = ClientSubscriber(socket, out, isChunked)
 
-                    // 先清理已有旧连接
+                    // 先标记并清理已有旧连接 (主动关闭不触发 onClientDisconnected 级联销毁)
                     for (oldSub in subscribers) {
+                        oldSub.isClosedManually = true
                         try { oldSub.socket.close() } catch (_: Exception) {}
                     }
                     subscribers.clear()
                     ringBuffer.clear()
 
-                    // 先写响应头、44 字节实时 WAV 头与 400ms 首包预填充并立即 flush
+                    // 先写响应头、44 字节实时 WAV 头与 200ms 首包预填充并立即 flush
                     if (isChunked) {
                         sendChunkedHeaders(out)
                         sendChunk(out, wavHeader, 0, wavHeader.size)
@@ -244,10 +250,13 @@ class LocalHttpServer(val port: Int = 8088) {
                     out.flush()
 
                     subscribers.add(subscriber)
+                    streamStartTimeNanos = System.nanoTime()
+                    totalBytesSent = 38400L // 初始已有 200ms 写入内核 Socket 形成弹性领先水位
+
                     synchronized(pacerLock) {
                         pacerLock.notifyAll()
                     }
-                    Log.i(tag, "Client subscribed to audio stream: ${socket.remoteSocketAddress}. 44-byte WAV header and 400ms silence pre-buffer sent and flushed. Pipeline is ACTIVE.")
+                    Log.i(tag, "Client subscribed to audio stream: ${socket.remoteSocketAddress}. 44-byte WAV header and 200ms silence lead-buffer sent and flushed. Pipeline is ACTIVE.")
                     return
                 }
             }
@@ -265,14 +274,13 @@ class LocalHttpServer(val port: Int = 8088) {
 
     /**
      * 高精度单调时钟匀速发包器 (Streaming Pacer)
-     * 基于 System.nanoTime() 锚定时间轴，以严格的 48kHz 16-bit 双声道节奏 (192,000 字节/秒，每 20ms 一包 3840 字节)
-     * 匀速推流，平滑所有解码突发 (Burst)。
-     * 出队融合：有真实数据送出真实数据；无真实数据动态送出静音；新曲目到达时零残留立即接续。
+     * 基于 System.nanoTime() 物理时间轴与高精度纳秒级误差累积补偿 (nanoTime drift compensation)
+     * 维持 ~200ms 弹性平滑水位，平滑所有 Android OS 线程调度与定时器抖动，完全杜绝欠载卡顿与积压延迟。
+     * 出队融合：若缓冲水位有真实音频立即送出；若水位不足则补齐全 0 静音，零残留零延迟接力。
      */
     private fun runStreamingPacer() {
-        Log.i(tag, "Streaming Pacer thread started (${CHUNK_MS}ms / $CHUNK_BYTES bytes pacing, strictly 192,000 B/s)")
+        Log.i(tag, "Streaming Pacer thread started (nanoTime drift-compensated pacing with 200ms lead buffer)")
         val sendBuffer = ByteArray(CHUNK_BYTES)
-        var nextSendTimeNanos = System.nanoTime()
 
         while (isRunning.get()) {
             try {
@@ -286,49 +294,77 @@ class LocalHttpServer(val port: Int = 8088) {
                             }
                         }
                     }
-                    nextSendTimeNanos = System.nanoTime()
                     if (!isRunning.get()) break
                 }
 
-                // 1. 高精度时钟对齐
                 val now = System.nanoTime()
-                val waitNanos = nextSendTimeNanos - now
-                if (waitNanos > 2_000_000L) { // 剩余时间 > 2ms，进入休眠
+                val elapsedNanos = (now - streamStartTimeNanos).coerceAtLeast(0L)
+                // 物理时间轴应当达到的水位 = 实际流逝时间对应的字节数 + 200ms 弹性领先水位
+                val targetBytes = (elapsedNanos * BYTES_PER_SECOND) / 1_000_000_000L + LEAD_BUFFER_BYTES
+
+                // 若系统休眠或调度导致落后超过 500ms，重置时钟锚点，杜绝突发追赶倾泻 (Burst Catch-up)
+                if (targetBytes - totalBytesSent > MAX_CATCHUP_BYTES) {
+                    streamStartTimeNanos = now
+                    totalBytesSent = LEAD_BUFFER_BYTES
+                    continue
+                }
+
+                // 1. 纳秒级误差累积补偿：若当前发送量落后于 targetBytes，以 20ms 包为粒度连续发包追齐水位
+                var sentInThisTick = false
+                while (totalBytesSent < targetBytes && isRunning.get() && subscribers.isNotEmpty()) {
+                    val hasRealAudio = ringBuffer.read(sendBuffer, 0, CHUNK_BYTES)
+                    if (!hasRealAudio) {
+                        sendBuffer.fill(0)
+                    }
+
+                    for (subscriber in subscribers) {
+                        try {
+                            if (subscriber.isChunked) {
+                                sendChunk(subscriber.outputStream, sendBuffer, 0, CHUNK_BYTES)
+                            } else {
+                                subscriber.outputStream.write(sendBuffer, 0, CHUNK_BYTES)
+                            }
+                        } catch (e: Exception) {
+                            Log.w(tag, "Pacer write exception (${e.javaClass.simpleName}: ${e.message}), removing client ${subscriber.socket.remoteSocketAddress}")
+                            subscribers.remove(subscriber)
+                            try { subscriber.socket.close() } catch (_: Exception) {}
+                            if (!subscriber.isClosedManually && subscribers.isEmpty()) {
+                                notifyClientDisconnected("Pacer write failed: ${e.message}")
+                            }
+                        }
+                    }
+                    totalBytesSent += CHUNK_BYTES
+                    sentInThisTick = true
+                }
+
+                // 若本轮有数据写入，统一 flush 一次，确保写入内核网络缓冲区无延迟且无冗余 I/O 锁竞争
+                if (sentInThisTick) {
+                    for (subscriber in subscribers) {
+                        try {
+                            subscriber.outputStream.flush()
+                        } catch (_: Exception) {}
+                    }
+                }
+
+                // 2. 高精度休眠节流：计算领先字节量与对应的等待时长
+                val curNow = System.nanoTime()
+                val curElapsed = (curNow - streamStartTimeNanos).coerceAtLeast(0L)
+                val curExpected = (curElapsed * BYTES_PER_SECOND) / 1_000_000_000L + LEAD_BUFFER_BYTES
+                val aheadBytes = totalBytesSent - curExpected
+
+                if (aheadBytes > 0) {
+                    val waitNanos = (aheadBytes * 1_000_000_000L) / BYTES_PER_SECOND
                     val sleepMs = waitNanos / 1_000_000L
-                    Thread.sleep(sleepMs)
-                } else if (waitNanos > 0) {
+                    if (sleepMs > 2L) {
+                        // 预留 2ms 冗余以抵抗 Android 线程休眠漂移超标，剩余毫秒以微睡眠等待
+                        Thread.sleep((sleepMs - 2L).coerceAtMost(20L))
+                    } else {
+                        Thread.yield()
+                    }
+                } else {
                     Thread.yield()
                 }
 
-                val curTime = System.nanoTime()
-                // 若由于系统休眠或调度落后超过 50ms，重置时钟锚点，杜绝突发追赶倾泻 (Burst Catch-up)
-                if (curTime - nextSendTimeNanos > 50_000_000L) {
-                    nextSendTimeNanos = curTime
-                }
-                nextSendTimeNanos += TARGET_NANOS_PER_CHUNK
-
-                // 2. 出队融合：若缓冲水位有真实音频立即送出；若水位不足则补齐全 0 静音，保证绝对零静音残留
-                val hasRealAudio = ringBuffer.read(sendBuffer, 0, CHUNK_BYTES)
-                if (!hasRealAudio) {
-                    sendBuffer.fill(0)
-                }
-
-                // 3. 严格匀速写入活跃客户端 Socket
-                for (subscriber in subscribers) {
-                    try {
-                        if (subscriber.isChunked) {
-                            sendChunk(subscriber.outputStream, sendBuffer, 0, CHUNK_BYTES)
-                        } else {
-                            subscriber.outputStream.write(sendBuffer, 0, CHUNK_BYTES)
-                            subscriber.outputStream.flush()
-                        }
-                    } catch (e: Exception) {
-                        Log.w(tag, "Pacer write exception (${e.javaClass.simpleName}: ${e.message}), removing client ${subscriber.socket.remoteSocketAddress}")
-                        subscribers.remove(subscriber)
-                        try { subscriber.socket.close() } catch (_: Exception) {}
-                        notifyClientDisconnected("Pacer write failed: ${e.message}")
-                    }
-                }
             } catch (_: InterruptedException) {
                 break
             } catch (e: Exception) {
@@ -429,6 +465,7 @@ class LocalHttpServer(val port: Int = 8088) {
         ringBuffer.clear()
 
         for (subscriber in subscribers) {
+            subscriber.isClosedManually = true
             try {
                 if (subscriber.isChunked) {
                     subscriber.outputStream.write("0\r\n\r\n".toByteArray(Charsets.US_ASCII))

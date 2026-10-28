@@ -48,12 +48,13 @@ export const initDlna = () => {
     // 只要原生端转为 IDLE 或 STOPPED，无论出于何种原因（断开、被抢占或用户主动停止），
     // 必须无条件同步更新为 IDLE，恢复本地音量，重置 currentDevice
     if (newState === 'IDLE' || newState === 'STOPPED') {
+      const wasActive = state.state === 'STREAMING' || state.state === 'CONNECTING'
       state.state = 'IDLE'
       state.currentDevice = null
       void setVolume(state.savedVolume)
-      if (message === 'DISCONNECTED') {
+      if (wasActive && message === 'DISCONNECTED') {
         toast('投送连接已中断，手机声音已恢复')
-      } else if (message === 'PREEMPTED') {
+      } else if (wasActive && message === 'PREEMPTED') {
         toast('投送已被其他设备接管，手机声音已恢复')
       }
       notifyListeners()
@@ -62,6 +63,14 @@ export const initDlna = () => {
 
     // 处于 STREAMING 时，仅忽略后台的 SCANNING 状态，不可被扫描临时冲掉
     if (state.state === 'STREAMING' && newState === 'SCANNING') {
+      return
+    }
+
+    // 原生端切入 STREAMING 时，强制将前端状态对齐为 STREAMING 并执行本地音轨静音
+    if (newState === 'STREAMING') {
+      state.state = 'STREAMING'
+      void setVolume(0)
+      notifyListeners()
       return
     }
 
@@ -128,13 +137,13 @@ export const connectDlnaDevice = async(device: DlnaDevice): Promise<boolean> => 
     // 1. 记录当前应用音量 (不影响系统全局媒体音量)
     state.savedVolume = settingState.setting['player.volume'] ?? 1
     state.state = 'CONNECTING'
+    state.currentDevice = device
     notifyListeners()
 
     toast(`正在连接到 ${device.name}...`)
     const success = await nativeStartStreaming(device, 8088)
 
-    // 严密防竞态：检查在连接握手期间，原生端是否已触发了断开事件将状态重置为 IDLE/STOPPED
-    if (success && state.state === 'CONNECTING') {
+    if (success) {
       state.currentDevice = device
       state.state = 'STREAMING'
 
@@ -148,11 +157,7 @@ export const connectDlnaDevice = async(device: DlnaDevice): Promise<boolean> => 
       state.currentDevice = null
       await setVolume(state.savedVolume)
       notifyListeners()
-      if (success) {
-        toast(`连接至 ${device.name} 已中断`)
-      } else {
-        toast(`连接至 ${device.name} 失败`)
-      }
+      toast(`连接至 ${device.name} 失败`)
       return false
     }
   } catch (err: any) {

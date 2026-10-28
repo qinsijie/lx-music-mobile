@@ -172,12 +172,7 @@ object DlnaManager {
                         throw IllegalStateException("[Play 阶段] $err")
                     }
 
-                    // c) 确认收到 Play 成功报文后，严密校验底层连接状态
-                    if (currentState.get() != DlnaState.CONNECTING || localHttpServer?.isRunning() != true) {
-                        throw IllegalStateException("连接在完成握手前已中断")
-                    }
-
-                    // d) 激活 STREAMING 状态
+                    // c) 确认收到 Play 成功报文后，第一时间激活 STREAMING 状态并向前端返回成功
                     updateState(DlnaState.STREAMING)
                     Log.i(TAG, "Successfully started streaming to ${device.friendlyName}")
                     callback?.invoke(true, null)
