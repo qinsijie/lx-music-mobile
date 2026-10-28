@@ -15,34 +15,45 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 线程安全 PCM 环形缓冲区 (PcmRingBuffer)
- * 深度设为 250ms (48000Hz * 2 channels * 2 bytes * 0.25s = 48,000 字节)
- * 彻底解耦 ExoPlayer 解码线程突发 (Burst) 与网络物理时钟恒定匀速推送
+ * 深度设为 1.5 秒 (48000Hz * 2 channels * 2 bytes * 1.5s = 288,000 字节)
+ * 彻底解耦 ExoPlayer / MediaCodec 解码线程突发 (Burst) 与网络物理时钟恒定匀速推送，杜绝缓冲假满丢包
  */
-class PcmRingBuffer(val capacity: Int = 48000) {
+class PcmRingBuffer(val capacity: Int = 288000) {
     private val buffer = ByteArray(capacity)
     private var head = 0
     private var tail = 0
     private var size = 0
     private val lock = java.lang.Object()
 
+    private val totalInboundBytes = java.util.concurrent.atomic.AtomicLong(0L)
+    private val inboundBytesInterval = java.util.concurrent.atomic.AtomicLong(0L)
+    private val totalDroppedBytes = java.util.concurrent.atomic.AtomicLong(0L)
+    private val droppedEventsCount = java.util.concurrent.atomic.AtomicLong(0L)
+
     fun write(data: ByteArray, offset: Int, length: Int): Int {
         if (length <= 0) return 0
+        totalInboundBytes.addAndGet(length.toLong())
+        inboundBytesInterval.addAndGet(length.toLong())
+
         synchronized(lock) {
             var written = 0
             while (written < length) {
                 val availableSpace = capacity - size
                 if (availableSpace <= 0) {
-                    // 缓冲区已满，微等待 15ms 让 Pacer 匀速消费，提供平滑背压
+                    // 缓冲区已满，等待 25ms 让 Pacer 匀速消费，提供平滑背压
                     try {
-                        lock.wait(15)
+                        lock.wait(25)
                     } catch (_: InterruptedException) {
                         break
                     }
                     if (capacity - size <= 0) {
-                        // 若超时仍满则丢弃最老数据，防止彻底阻塞 ExoPlayer 播放器内部线程
+                        // 若超时仍满则丢弃最老数据，记录丢弃字节数
                         val dropSize = minOf(size, length - written)
                         head = (head + dropSize) % capacity
                         size -= dropSize
+                        totalDroppedBytes.addAndGet(dropSize.toLong())
+                        droppedEventsCount.incrementAndGet()
+                        Log.w("PcmRingBuffer", "Buffer overflow! Dropped $dropSize bytes (total dropped: ${totalDroppedBytes.get()})")
                     }
                 }
                 val toWrite = minOf(length - written, capacity - size)
@@ -96,6 +107,12 @@ class PcmRingBuffer(val capacity: Int = 48000) {
     }
 
     fun available(): Int = synchronized(lock) { size }
+
+    fun getAndResetInboundBytes(): Long = inboundBytesInterval.getAndSet(0L)
+
+    fun getTotalDroppedBytes(): Long = totalDroppedBytes.get()
+
+    fun getDroppedEventsCount(): Long = droppedEventsCount.get()
 }
 
 /**
@@ -125,7 +142,7 @@ class LocalHttpServer(val port: Int = 8088) {
     private val crlf = "\r\n".toByteArray(Charsets.US_ASCII)
 
     // 环形缓冲与高精度时钟匀速发包器
-    private val ringBuffer = PcmRingBuffer(48000) // 250ms 缓冲池
+    private val ringBuffer = PcmRingBuffer(288000) // 1.5 秒缓冲池 (288,000 字节，给 ExoPlayer 充分突发解码空间)
     private val BYTES_PER_SECOND = 192000L // 48000 * 2 * 2 (16-bit stereo)
     private val CHUNK_BYTES = 3840 // 20ms 一包 (960 采样帧)
     private val LEAD_BUFFER_BYTES = 76800L // 维持 400ms 弹性平滑跑道 (192,000 * 0.4s = 76,800 字节，抗 DSD128 重度上采样与空口微休眠)
@@ -287,6 +304,13 @@ class LocalHttpServer(val port: Int = 8088) {
         Log.i(tag, "Streaming Pacer thread started with THREAD_PRIORITY_AUDIO (nanoTime drift-compensated pacing with 400ms lead buffer)")
         val sendBuffer = ByteArray(CHUNK_BYTES)
 
+        // 1秒轻量级聚合诊断打点变量
+        var diagLastLogNanos = System.nanoTime()
+        var diagBytesSent = 0L
+        var diagSilenceChunks = 0L
+        var diagSilenceBytes = 0L
+        var diagRealChunks = 0L
+
         while (isRunning.get()) {
             try {
                 if (subscribers.isEmpty()) {
@@ -304,10 +328,10 @@ class LocalHttpServer(val port: Int = 8088) {
 
                 val now = System.nanoTime()
                 val elapsedNanos = (now - streamStartTimeNanos).coerceAtLeast(0L)
-                // 物理时间轴应当达到的水位 = 实际流逝时间对应的字节数 + 200ms 弹性领先水位
+                // 物理时间轴应当达到的水位 = 实际流逝时间对应的字节数 + 400ms 弹性领先跑道
                 val targetBytes = (elapsedNanos * BYTES_PER_SECOND) / 1_000_000_000L + LEAD_BUFFER_BYTES
 
-                // 若系统休眠或调度导致落后超过 500ms，重置时钟锚点，杜绝突发追赶倾泻 (Burst Catch-up)
+                // 若系统休眠或调度导致落后超过 1000ms，重置时钟锚点，杜绝突发追赶倾泻 (Burst Catch-up)
                 if (targetBytes - totalBytesSent > MAX_CATCHUP_BYTES) {
                     streamStartTimeNanos = now
                     totalBytesSent = LEAD_BUFFER_BYTES
@@ -320,6 +344,10 @@ class LocalHttpServer(val port: Int = 8088) {
                     val hasRealAudio = ringBuffer.read(sendBuffer, 0, CHUNK_BYTES)
                     if (!hasRealAudio) {
                         sendBuffer.fill(0)
+                        diagSilenceChunks++
+                        diagSilenceBytes += CHUNK_BYTES
+                    } else {
+                        diagRealChunks++
                     }
 
                     for (subscriber in subscribers) {
@@ -339,6 +367,7 @@ class LocalHttpServer(val port: Int = 8088) {
                         }
                     }
                     totalBytesSent += CHUNK_BYTES
+                    diagBytesSent += CHUNK_BYTES
                     sentInThisTick = true
                 }
 
@@ -370,11 +399,37 @@ class LocalHttpServer(val port: Int = 8088) {
                     Thread.yield()
                 }
 
-            } catch (_: InterruptedException) {
-                break
-            } catch (e: Exception) {
-                if (isRunning.get()) {
-                    Log.e(tag, "Error in streaming pacer loop", e)
+                // 3. 每秒聚合打印一次精准诊断日志 (零 I/O 损耗)
+                val diagNow = System.nanoTime()
+                if (diagNow - diagLastLogNanos >= 1_000_000_000L && subscribers.isNotEmpty()) {
+                    val diagElapsedSec = (diagNow - diagLastLogNanos) / 1_000_000_000.0
+                    val speedKb = (diagBytesSent / diagElapsedSec) / 1024.0
+                    val inBytes = ringBuffer.getAndResetInboundBytes()
+                    val inSpeedKb = (inBytes / diagElapsedSec) / 1024.0
+
+                    val ringAvailBytes = ringBuffer.available()
+                    val ringAvailMs = (ringAvailBytes * 1000L) / BYTES_PER_SECOND
+
+                    val targetNanos = ((totalBytesSent - LEAD_BUFFER_BYTES) * 1_000_000_000L) / BYTES_PER_SECOND
+                    val actualElapsedNanos = diagNow - streamStartTimeNanos
+                    val driftMs = (actualElapsedNanos - targetNanos) / 1_000_000.0
+
+                    val leadBytes = (totalBytesSent - ((diagNow - streamStartTimeNanos) * BYTES_PER_SECOND / 1_000_000_000L)).coerceAtLeast(0L)
+                    val leadMs = (leadBytes * 1000L) / BYTES_PER_SECOND
+
+                    val droppedBytes = ringBuffer.getTotalDroppedBytes()
+
+                    Log.i("DLNA-PACER-DIAG", String.format(
+                        java.util.Locale.US,
+                        "[DLNA-PACER-DIAG] Speed: %.1f KB/s (In: %.1f KB/s) | RingBuffer: %dms (%dB) | Underrun: %d pkts (%dB) | LeadBuffer: %dms | Drift: %+.1fms | Dropped: %dB",
+                        speedKb, inSpeedKb, ringAvailMs, ringAvailBytes, diagSilenceChunks, diagSilenceBytes, leadMs, driftMs, droppedBytes
+                    ))
+
+                    diagLastLogNanos = diagNow
+                    diagBytesSent = 0L
+                    diagSilenceChunks = 0L
+                    diagSilenceBytes = 0L
+                    diagRealChunks = 0L
                 }
             }
         }

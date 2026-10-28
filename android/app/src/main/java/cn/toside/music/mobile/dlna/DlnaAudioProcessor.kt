@@ -116,6 +116,7 @@ class DlnaAudioProcessor : BaseAudioProcessor() {
 
     override fun onFlush() {
         super.onFlush()
+        Log.i(tag, "AudioProcessor onFlush() invoked (seek / track change / pipeline flush). Clearing RingBuffer.")
         DlnaManager.clearPcmBuffer()
     }
 
