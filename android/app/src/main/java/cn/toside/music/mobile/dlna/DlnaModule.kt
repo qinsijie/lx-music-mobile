@@ -101,6 +101,10 @@ class DlnaModule(private val reactContext: ReactApplicationContext) :
             } else {
                 map.putNull("device")
             }
+            val (sr, ch, bits) = DlnaManager.getAudioFormat()
+            map.putInt("sampleRate", sr)
+            map.putInt("channels", ch)
+            map.putInt("bitsPerSample", bits)
             promise.resolve(map)
         } catch (e: Exception) {
             promise.reject("GET_STATE_ERROR", e.message, e)
@@ -118,6 +122,14 @@ class DlnaModule(private val reactContext: ReactApplicationContext) :
     }
 
     // --- DlnaEventListener 回调派发至 JS 端 ---
+
+    override fun onAudioFormatChanged(sampleRate: Int, channels: Int, bitsPerSample: Int) {
+        val params = Arguments.createMap()
+        params.putInt("sampleRate", sampleRate)
+        params.putInt("channels", channels)
+        params.putInt("bitsPerSample", bitsPerSample)
+        sendEvent("onDlnaAudioFormatChanged", params)
+    }
 
     override fun onStateChanged(state: DlnaState, message: String?) {
         val params = Arguments.createMap()

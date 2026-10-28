@@ -21,7 +21,9 @@ export interface DlnaModalType {
 export default forwardRef<DlnaModalType, {}>((props, ref) => {
   const dialogRef = useRef<DialogType>(null)
   const theme = useTheme()
-  const { state, currentDevice, devices, isScanning, isStreaming } = useDlna()
+  const { state, currentDevice, devices, isScanning, isStreaming, sampleRate, bitsPerSample } = useDlna()
+
+  const formatText = `${(sampleRate / 1000).toFixed(1)}kHz / ${bitsPerSample}-Bit`
 
   useImperativeHandle(ref, () => ({
     show() {
@@ -72,14 +74,23 @@ export default forwardRef<DlnaModalType, {}>((props, ref) => {
               backgroundColor: isStreaming ? '#52c41a' : (state === 'CONNECTING' ? '#faad14' : '#d9d9d9'),
             }} />
             <View style={styles.statusTextWrap}>
-              <Text size={13} style={{ fontWeight: 'bold' }}>
+              <View style={styles.statusTitleRow}>
+                <Text size={13} numberOfLines={1} style={styles.statusTitle}>
+                  {isStreaming
+                    ? `串流中: ${currentDevice?.name ?? 'HQPlayer'}`
+                    : (state === 'CONNECTING' ? '正在连接设备...' : '手机扬声器发声 (未投送)')}
+                </Text>
+                {isStreaming && (
+                  <View style={{ ...styles.formatBadge, borderColor: theme['c-primary'] }}>
+                    <Text size={10} color={theme['c-primary']} style={{ fontWeight: 'bold' }}>
+                      {formatText}
+                    </Text>
+                  </View>
+                )}
+              </View>
+              <Text size={11} color={theme['c-font-label']} numberOfLines={1}>
                 {isStreaming
-                  ? `串流中: ${currentDevice?.name ?? 'HQPlayer'}`
-                  : (state === 'CONNECTING' ? '正在连接设备...' : '手机扬声器发声 (未投送)')}
-              </Text>
-              <Text size={11} color={theme['c-font-label']}>
-                {isStreaming
-                  ? `手机端已单应用静音 | 远端: ${currentDevice?.ip}:${currentDevice?.port}`
+                  ? `手机端已静音 | 源码直通: ${currentDevice?.ip}:${currentDevice?.port}`
                   : '点击下方设备即可定向推流至 HQPlayer 音响'}
               </Text>
             </View>
@@ -193,6 +204,22 @@ const styles = StyleSheet.create({
   },
   statusTextWrap: {
     flex: 1,
+  },
+  statusTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'nowrap',
+  },
+  statusTitle: {
+    fontWeight: 'bold',
+    flexShrink: 1,
+  },
+  formatBadge: {
+    marginLeft: 6,
+    paddingHorizontal: 5,
+    paddingVertical: 1,
+    borderRadius: 3,
+    borderWidth: 1,
   },
   disconnectBtn: {
     paddingHorizontal: 10,

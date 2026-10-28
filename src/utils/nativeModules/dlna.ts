@@ -16,6 +16,9 @@ export type DlnaState = 'IDLE' | 'SCANNING' | 'CONNECTING' | 'STREAMING' | 'STOP
 export interface DlnaStatus {
   state: DlnaState
   device: DlnaDevice | null
+  sampleRate?: number
+  channels?: number
+  bitsPerSample?: number
 }
 
 const isAndroid = Platform.OS === 'android' && Boolean(LxDlnaModule)
@@ -99,5 +102,15 @@ export const onDlnaError = (handler: (error: string) => void): (() => void) => {
   const subscription = emitter.addListener('onDlnaError', (data: { error: string }) => {
     handler(data.error || 'Unknown DLNA error')
   })
+  return () => subscription.remove()
+}
+
+/**
+ * 监听推流音频规格变化 (Bit-Perfect 源码规格)
+ */
+export const onDlnaAudioFormatChanged = (handler: (format: { sampleRate: number; channels: number; bitsPerSample: number }) => void): (() => void) => {
+  const emitter = getEventEmitter()
+  if (!emitter) return () => {}
+  const subscription = emitter.addListener('onDlnaAudioFormatChanged', handler)
   return () => subscription.remove()
 }

@@ -9,6 +9,7 @@ import {
   onDlnaStateChanged,
   onDlnaDevicesDiscovered,
   onDlnaError,
+  onDlnaAudioFormatChanged,
 } from '@/utils/nativeModules/dlna'
 import { setVolume } from '@/plugins/player'
 import settingState from '@/store/setting/state'
@@ -20,6 +21,9 @@ export interface DlnaCoreState {
   devices: DlnaDevice[]
   isScanning: boolean
   savedVolume: number
+  sampleRate: number
+  channels: number
+  bitsPerSample: number
 }
 
 const state: DlnaCoreState = {
@@ -28,6 +32,9 @@ const state: DlnaCoreState = {
   devices: [],
   isScanning: false,
   savedVolume: 1,
+  sampleRate: 44100,
+  channels: 2,
+  bitsPerSample: 16,
 }
 
 const listeners = new Set<() => void>()
@@ -91,10 +98,21 @@ export const initDlna = () => {
     notifyListeners()
   })
 
+  // 监听推流音频规格 (Bit-Perfect 源码规格)
+  onDlnaAudioFormatChanged((format) => {
+    state.sampleRate = format.sampleRate
+    state.channels = format.channels
+    state.bitsPerSample = format.bitsPerSample
+    notifyListeners()
+  })
+
   // 同步初始状态
   void nativeGetDlnaState().then(status => {
     state.state = status.state
     state.currentDevice = status.device
+    if (status.sampleRate) state.sampleRate = status.sampleRate
+    if (status.channels) state.channels = status.channels
+    if (status.bitsPerSample) state.bitsPerSample = status.bitsPerSample
     notifyListeners()
   })
 }
@@ -220,5 +238,8 @@ export const useDlna = () => {
     devices: state.devices,
     isScanning: state.isScanning,
     isStreaming: state.state === 'STREAMING',
+    sampleRate: state.sampleRate,
+    channels: state.channels,
+    bitsPerSample: state.bitsPerSample,
   }
 }

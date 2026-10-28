@@ -33,6 +33,7 @@ interface DlnaEventListener {
     fun onStateChanged(state: DlnaState, message: String? = null)
     fun onDevicesDiscovered(devices: List<DlnaDevice>)
     fun onError(errorMessage: String)
+    fun onAudioFormatChanged(sampleRate: Int, channels: Int, bitsPerSample: Int) {}
 }
 
 /**
@@ -346,6 +347,7 @@ object DlnaManager {
         Log.i(TAG, "Audio format set/updated: ${sampleRate}Hz, ${channels}ch, ${bitsPerSample}bit (previous: ${oldRate}Hz, ${oldChannels}ch, ${oldBits}bit, changed=$formatChanged)")
 
         localHttpServer?.updateAudioFormat(sampleRate, channels, bitsPerSample)
+        eventListener?.onAudioFormatChanged(sampleRate, channels, bitsPerSample)
 
         // 跨采样率切歌保护机制 (Hi-Res 兼容性)
         if (isStreaming() && formatChanged) {
@@ -353,6 +355,8 @@ object DlnaManager {
             reNegotiateSession(sampleRate, channels, bitsPerSample)
         }
     }
+
+    fun getAudioFormat(): Triple<Int, Int, Int> = Triple(currentSampleRate, currentChannels, currentBitsPerSample)
 
     private fun reNegotiateSession(sampleRate: Int, channels: Int, bitsPerSample: Int) {
         val device = currentDevice ?: return

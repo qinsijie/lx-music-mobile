@@ -449,38 +449,40 @@ class LocalHttpServer(
                     Thread.yield()
                 }
 
-                // 3. 每秒聚合打印一次精准诊断日志 (零 I/O 损耗)
-                val diagNow = System.nanoTime()
-                if (diagNow - diagLastLogNanos >= 1_000_000_000L && subscribers.isNotEmpty()) {
-                    val diagElapsedSec = (diagNow - diagLastLogNanos) / 1_000_000_000.0
-                    val speedKb = (diagBytesSent / diagElapsedSec) / 1024.0
-                    val inBytes = ringBuffer.getAndResetInboundBytes()
-                    val inSpeedKb = (inBytes / diagElapsedSec) / 1024.0
+                // 3. 每秒聚合打印一次精准诊断日志 (仅在 DEBUG 环境开启，Release 零开销零 I/O 损耗)
+                if (cn.toside.music.mobile.BuildConfig.DEBUG) {
+                    val diagNow = System.nanoTime()
+                    if (diagNow - diagLastLogNanos >= 1_000_000_000L && subscribers.isNotEmpty()) {
+                        val diagElapsedSec = (diagNow - diagLastLogNanos) / 1_000_000_000.0
+                        val speedKb = (diagBytesSent / diagElapsedSec) / 1024.0
+                        val inBytes = ringBuffer.getAndResetInboundBytes()
+                        val inSpeedKb = (inBytes / diagElapsedSec) / 1024.0
 
-                    val ringAvailBytes = ringBuffer.available()
-                    val ringAvailMs = (ringAvailBytes * 1000L) / curByteRate
+                        val ringAvailBytes = ringBuffer.available()
+                        val ringAvailMs = (ringAvailBytes * 1000L) / curByteRate
 
-                    val targetNanos = ((totalBytesSent - curLeadBytes) * 1_000_000_000L) / curByteRate
-                    val actualElapsedNanos = diagNow - streamStartTimeNanos
-                    val driftMs = (actualElapsedNanos - targetNanos) / 1_000_000.0
+                        val targetNanos = ((totalBytesSent - curLeadBytes) * 1_000_000_000L) / curByteRate
+                        val actualElapsedNanos = diagNow - streamStartTimeNanos
+                        val driftMs = (actualElapsedNanos - targetNanos) / 1_000_000.0
 
-                    val leadBytes = (totalBytesSent - ((diagNow - streamStartTimeNanos) * curByteRate / 1_000_000_000L)).coerceAtLeast(0L)
-                    val leadMs = (leadBytes * 1000L) / curByteRate
+                        val leadBytes = (totalBytesSent - ((diagNow - streamStartTimeNanos) * curByteRate / 1_000_000_000L)).coerceAtLeast(0L)
+                        val leadMs = (leadBytes * 1000L) / curByteRate
 
-                    val droppedBytes = ringBuffer.getTotalDroppedBytes()
+                        val droppedBytes = ringBuffer.getTotalDroppedBytes()
 
-                    Log.i("DLNA-PACER-DIAG", String.format(
-                        java.util.Locale.US,
-                        "[DLNA-PACER-DIAG] [%dHz %dch %dbit] Speed: %.1f KB/s (In: %.1f KB/s) | RingBuffer: %dms (%dB) | Underrun: %d pkts (%dB) | LeadBuffer: %dms | Drift: %+.1fms | Dropped: %dB",
-                        curSr, curCh, curBits,
-                        speedKb, inSpeedKb, ringAvailMs, ringAvailBytes, diagSilenceChunks, diagSilenceBytes, leadMs, driftMs, droppedBytes
-                    ))
+                        Log.i("DLNA-PACER-DIAG", String.format(
+                            java.util.Locale.US,
+                            "[DLNA-PACER-DIAG] [%dHz %dch %dbit] Speed: %.1f KB/s (In: %.1f KB/s) | RingBuffer: %dms (%dB) | Underrun: %d pkts (%dB) | LeadBuffer: %dms | Drift: %+.1fms | Dropped: %dB",
+                            curSr, curCh, curBits,
+                            speedKb, inSpeedKb, ringAvailMs, ringAvailBytes, diagSilenceChunks, diagSilenceBytes, leadMs, driftMs, droppedBytes
+                        ))
 
-                    diagLastLogNanos = diagNow
-                    diagBytesSent = 0L
-                    diagSilenceChunks = 0L
-                    diagSilenceBytes = 0L
-                    diagRealChunks = 0L
+                        diagLastLogNanos = diagNow
+                        diagBytesSent = 0L
+                        diagSilenceChunks = 0L
+                        diagSilenceBytes = 0L
+                        diagRealChunks = 0L
+                    }
                 }
             } catch (_: InterruptedException) {
                 break
